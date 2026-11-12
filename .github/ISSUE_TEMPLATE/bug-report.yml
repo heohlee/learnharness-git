@@ -1,0 +1,51 @@
+name: Bug report
+description: Report incorrect behavior in learnharness-git
+title: "[Bug] "
+labels: ["bug"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem in learnharness-git. Describe what happened, what you expected, and how to reproduce it.
+
+        **Do not paste tokens, credentials or personal data.**
+  - type: textarea
+    id: problem
+    attributes:
+      label: Observed behavior
+      description: Describe the incorrect behavior you observed and what you were doing when it happened.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the behavior you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the steps to reproduce the problem, including relevant inputs, commands, or URLs.
+    validations:
+      required: true
+  # kit:local fields
+  # /kit:local fields
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add screenshots, logs, versions, environment details, or other relevant information. Remove tokens, credentials and personal data first.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and did not find an equivalent report.
+          required: true
+        - label: I removed tokens, credentials and personal data from everything I pasted.
+          required: true
