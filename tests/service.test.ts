@@ -37,6 +37,7 @@ function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: 
 		pull: record("pull", "pulled"),
 		push: record("push", "pushed"),
 		log: record("log", []),
+		userName: record("userName", "Ada"),
 		...options.git,
 	} as Git;
 	const service = createService({
@@ -67,13 +68,30 @@ describe("start", () => {
 			s.timers.map((t) => t.ms),
 			[300_000],
 		);
-		assert.deepEqual(s.calls, ["repoState", "pull"]);
+		assert.deepEqual(s.calls, ["repoState", "repoState", "pull"]);
 	});
 	test("schedules nothing with interval 0 and does not pull without pullOnStart", async () => {
 		const s = setup();
 		await s.service.start();
 		assert.deepEqual(s.timers, []);
-		assert.deepEqual(s.calls, []);
+		assert.deepEqual(s.calls, ["repoState"]);
+	});
+	test("exposes the next automatic sync time, or null when automation is off", async () => {
+		const s = setup({ settings: { autoSyncMinutes: 5 } });
+		await s.service.start();
+		assert.equal(
+			((await call(s, "state")) as { nextSync: string }).nextSync,
+			new Date(2026, 10, 12, 9, 35).toISOString(),
+		);
+		await call(s, "saveSettings", { autoSyncMinutes: 0 });
+		assert.equal(((await call(s, "state")) as { nextSync: null }).nextSync, null);
+	});
+	test("discovers an existing repository so views can render it", async () => {
+		for (const repo of [{ kind: "repo" }, { kind: "nested", topLevel: "/home" }] as RepoState[]) {
+			const s = setup({ repo });
+			await s.service.start();
+			assert.deepEqual(((await call(s, "state")) as { repo: RepoState }).repo, repo);
+		}
 	});
 	test("stop clears the timer", async () => {
 		const s = setup({ settings: { autoSyncMinutes: 1 } });
@@ -89,6 +107,7 @@ describe("auto sync tick", () => {
 		await s.service.start();
 		await s.service.tick();
 		assert.deepEqual(s.calls, [
+			"repoState",
 			"repoState",
 			`commit ${JSON.stringify(["learnharness backup: 2026-11-12 09:30", { all: true }])}`,
 		]);
@@ -220,6 +239,15 @@ describe("handlers", () => {
 			s.calls.filter((c) => c.startsWith("log")),
 			["log [100]", "log [1000]"],
 		);
+	});
+	test("userName reads the configured git user without emitting state", async () => {
+		const s = setup();
+		assert.equal(await call(s, "userName"), "Ada");
+		assert.deepEqual(
+			s.calls.filter((c) => c !== "repoState"),
+			["userName"],
+		);
+		assert.deepEqual(s.events, []);
 	});
 	test("saveSettings validates, saves, reschedules and emits state", async () => {
 		const s = setup({ settings: { autoSyncMinutes: 1 } });

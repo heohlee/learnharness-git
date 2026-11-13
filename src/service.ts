@@ -15,6 +15,8 @@ export interface State {
 	/** Automation stopped after a merge conflict; cleared by a successful pull. */
 	paused: boolean;
 	lastSync: string | null;
+	/** When the next automatic sync fires, or null when automation is off. */
+	nextSync: string | null;
 	lastError: string | null;
 	settings: Settings;
 }
@@ -53,6 +55,7 @@ export function createService(deps: {
 		busy: null,
 		paused: false,
 		lastSync: null,
+		nextSync: null,
 		lastError: null,
 		settings: { ...DEFAULT_SETTINGS },
 	};
@@ -110,8 +113,16 @@ export function createService(deps: {
 	function schedule(): void {
 		if (timer !== null) clock.clearInterval(timer);
 		timer = null;
-		const minutes = state.settings.autoSyncMinutes;
-		if (minutes > 0) timer = clock.setInterval(() => void tick(), minutes * 60_000);
+		const interval = state.settings.autoSyncMinutes * 60_000;
+		const plan = () => {
+			state.nextSync = interval > 0 ? new Date(clock.now().getTime() + interval).toISOString() : null;
+		};
+		plan();
+		if (interval > 0)
+			timer = clock.setInterval(() => {
+				plan();
+				void tick();
+			}, interval);
 	}
 
 	/** One automatic sync: commit everything, then pull and push when enabled. */
@@ -148,6 +159,8 @@ export function createService(deps: {
 	const handlers: Record<string, Handler> = {
 		state: async () => {
 			await ensureLoaded();
+			// rev-parse is read-only; refresh so views see a repository created or removed outside the plugin.
+			if (!state.busy) state.repo = await git.repoState();
 			return snapshot();
 		},
 		saveSettings: (input) =>
@@ -190,6 +203,7 @@ export function createService(deps: {
 			state.lastSync = clock.now().toISOString();
 			return { committed, pull: pullResult, push: pushResult };
 		}),
+		userName: inRepo("user name", () => git.userName(), read),
 		log: inRepo(
 			"log",
 			(input) => {
@@ -206,12 +220,14 @@ export function createService(deps: {
 		tick,
 		async start(): Promise<void> {
 			await ensureLoaded();
+			state.repo = await git.repoState();
 			schedule();
 			if (state.settings.pullOnStart) await handlers.pull?.(undefined).catch(() => {});
 		},
 		stop(): void {
 			if (timer !== null) clock.clearInterval(timer);
 			timer = null;
+			state.nextSync = null;
 		},
 	};
 }
