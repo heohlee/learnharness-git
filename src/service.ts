@@ -22,6 +22,10 @@ export interface State {
 	lastError: string | null;
 	/** URL of origin, or null when no remote is configured. */
 	remote: string | null;
+	/** A clone replaced the learning data; LearnHarness must restart to load it. */
+	restartRequired: boolean;
+	/** Where the last clone moved colliding local files, or null. */
+	cloneBackupDir: string | null;
 	settings: Settings;
 }
 
@@ -77,6 +81,8 @@ export function createService(deps: {
 		nextSync: null,
 		lastError: null,
 		remote: null,
+		restartRequired: false,
+		cloneBackupDir: null,
 		settings: { ...DEFAULT_SETTINGS },
 	};
 	let loaded: Promise<void> | null = null;
@@ -120,6 +126,12 @@ export function createService(deps: {
 	async function requireRepo(): Promise<void> {
 		state.repo = await git.repoState();
 		if (state.repo.kind !== "repo") throw new Error(NOT_A_REPO);
+	}
+
+	/** init and clone create a repository; one that already exists stays untouched. */
+	async function refuseRepo(): Promise<void> {
+		state.repo = await git.repoState();
+		if (state.repo.kind === "repo") throw new Error("The learning data folder is already a Git repository.");
 	}
 
 	async function pull() {
@@ -196,11 +208,22 @@ export function createService(deps: {
 			}),
 		init: () =>
 			exclusive("init", async () => {
-				state.repo = await git.repoState();
-				if (state.repo.kind === "repo") throw new Error("The learning data folder is already a Git repository.");
+				await refuseRepo();
 				await git.init();
 				state.repo = { kind: "repo" };
 			}),
+		clone: async (input) => {
+			const url = remoteUrl(input);
+			return exclusive("clone", async () => {
+				await refuseRepo();
+				const result = await git.clone(url, clock.now());
+				state.repo = { kind: "repo" };
+				state.remote = url;
+				state.restartRequired = true;
+				state.cloneBackupDir = result.backupDir;
+				return result;
+			});
+		},
 		status: inRepo("status", () => git.status(), read),
 		stage: inRepo("stage", (input) => git.stage(paths(input))),
 		unstage: inRepo("unstage", (input) => git.unstage(paths(input))),
