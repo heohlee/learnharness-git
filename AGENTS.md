@@ -17,11 +17,11 @@ Repository-local skills under `.agents/skills/` take precedence over generic or 
 
 ## Skills
 
-| Skill | Trigger | Path |
-| --- | --- | --- |
-| `git-workflow` | Starting any change in this repository (before the first write), creating or triaging an issue, labeling, planning work, creating a branch or worktree, or creating, preparing, reviewing or merging a pull request. | `.agents/skills/git-workflow/SKILL.md` |
-| `node-tests` | Node tests, `tests/*.test.ts`, the fake `git` runner, type stripping limits, or CI test evidence. | `.agents/skills/node-tests/SKILL.md` |
-| `release-notes` | Release notes or release messages. | `.agents/skills/release-notes/SKILL.md` |
+| Skill           | Trigger                                                                                                                                                                                                              | Path                                    |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| `git-workflow`  | Starting any change in this repository (before the first write), creating or triaging an issue, labeling, planning work, creating a branch or worktree, or creating, preparing, reviewing or merging a pull request. | `.agents/skills/git-workflow/SKILL.md`  |
+| `node-tests`    | Node tests, `tests/*.test.ts`, the fake `git` runner, type stripping limits, or CI test evidence.                                                                                                                    | `.agents/skills/node-tests/SKILL.md`    |
+| `release-notes` | Release notes or release messages.                                                                                                                                                                                   | `.agents/skills/release-notes/SKILL.md` |
 
 ## Learning data
 
