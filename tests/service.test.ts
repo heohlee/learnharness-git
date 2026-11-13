@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { ConflictError, type Git, type RepoState } from "../src/git.ts";
+import { ConflictError, type Git, MergeInProgressError, type RepoState } from "../src/git.ts";
 import { type Clock, createService } from "../src/service.ts";
 import { DEFAULT_SETTINGS, type Settings } from "../src/settings.ts";
 
@@ -38,6 +38,14 @@ function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: 
 		push: record("push", "pushed"),
 		log: record("log", []),
 		userName: record("userName", "Ada"),
+		remoteUrl: record("remoteUrl", null),
+		setRemote: record("setRemote", undefined),
+		publish: record("publish", undefined),
+		listFiles: record("listFiles", ["settings.json", "graph/nodes.jsonl"]),
+		historyFiles: record("historyFiles", []),
+		removeRemote: record("removeRemote", undefined),
+		pushUrls: record("pushUrls", []),
+		restorePushUrls: record("restorePushUrls", undefined),
 		...options.git,
 	} as Git;
 	const service = createService({
@@ -281,5 +289,117 @@ describe("handlers", () => {
 		await assert.rejects(call(s, "status"), { message: "locked" });
 		assert.deepEqual(s.events, []);
 		assert.equal(((await call(s, "state")) as { lastError: null }).lastError, null);
+	});
+});
+
+describe("remote", () => {
+	const URL = "git@github.com:me/learning-data.git";
+	test("state reports origin's URL", async () => {
+		const s = setup({ git: { remoteUrl: async () => URL } });
+		assert.equal(((await call(s, "state")) as { remote: string }).remote, URL);
+	});
+	test("previewRemote counts the files to push and lists the sensitive ones, without writing", async () => {
+		const s = setup();
+		assert.deepEqual(await call(s, "previewRemote", { url: URL }), {
+			url: URL,
+			files: 2,
+			sensitive: ["settings.json"],
+		});
+		assert.deepEqual(s.calls, ["repoState", "listFiles", "status", `historyFiles ${JSON.stringify(["main"])}`]);
+		assert.deepEqual(s.events, []);
+	});
+	const invalid: [unknown, string][] = [
+		["", "Remote URL must not be empty."],
+		["  ", "Remote URL must not be empty."],
+		["git@host:a b.git", "Remote URL must not contain spaces."],
+		["--upload-pack=x", "Remote URL must not start with “-”."],
+		[
+			"https://me:abc123@github.com/me/data.git",
+			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
+		],
+		[3, "Remote URL must not be empty."],
+		["git@h:a\nb.git", "Remote URL must not contain spaces."],
+		[
+			"https://ghp_abcdef123456@github.com/me/data.git",
+			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
+		],
+		[
+			"https://github.com/me/data.git?access_token=abc",
+			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
+		],
+	];
+	for (const [url, message] of invalid) {
+		test(`rejects remote URL ${JSON.stringify(url)} without running git`, async () => {
+			const s = setup();
+			await assert.rejects(call(s, "previewRemote", { url }), { message });
+			await assert.rejects(call(s, "connectRemote", { url }), { message });
+			assert.deepEqual(s.calls, []);
+		});
+	}
+	test("accepts a user name without a password", async () => {
+		const s = setup();
+		const url = "https://me@github.com/me/data.git";
+		assert.equal(((await call(s, "previewRemote", { url })) as { url: string }).url, url);
+	});
+	test("connectRemote commits pending changes, sets origin and pushes with upstream", async () => {
+		const s = setup();
+		assert.deepEqual(await call(s, "connectRemote", { url: ` ${URL} ` }), { remote: URL });
+		assert.deepEqual(s.calls, [
+			"repoState",
+			"status",
+			`commit ${JSON.stringify(["learnharness backup: 2026-11-12 09:30", { all: true }])}`,
+			"remoteUrl",
+			"pushUrls",
+			`setRemote ${JSON.stringify([URL])}`,
+			`publish ${JSON.stringify(["main"])}`,
+		]);
+		assert.equal(s.events.at(-1)?.topic, "state");
+	});
+	test("connectRemote refuses a detached HEAD before writing", async () => {
+		const s = setup({ git: { status: async () => ({ branch: null }) as never } });
+		await assert.rejects(call(s, "connectRemote", { url: URL }), {
+			message: "Check out a branch before connecting a remote.",
+		});
+	});
+	test("previewRemote flags sensitive files that exist only in history", async () => {
+		const s = setup({
+			git: { listFiles: async () => ["a.json"], historyFiles: async () => ["settings.json", "a.json"] },
+		});
+		assert.deepEqual(await call(s, "previewRemote", { url: URL }), {
+			url: URL,
+			files: 1,
+			sensitive: ["settings.json"],
+		});
+	});
+	test("connectRemote stops before setRemote and publish when the commit refuses an unfinished operation", async () => {
+		const s = setup({
+			git: {
+				commit: async () => {
+					throw new MergeInProgressError();
+				},
+			},
+		});
+		await assert.rejects(call(s, "connectRemote", { url: URL }), MergeInProgressError);
+		assert.deepEqual(s.calls, ["repoState", "status"]);
+	});
+	test("a failed push restores the previous origin and push URLs", async () => {
+		const s = setup({
+			git: {
+				remoteUrl: async () => "git@old:me/data.git",
+				pushUrls: async () => ["git@push:me/data.git"],
+				publish: async () => Promise.reject(new Error("git push failed: rejected")),
+			},
+		});
+		await assert.rejects(call(s, "connectRemote", { url: URL }), { message: "git push failed: rejected" });
+		assert.deepEqual(s.calls.slice(-3), [
+			`setRemote ${JSON.stringify([URL])}`,
+			`setRemote ${JSON.stringify(["git@old:me/data.git"])}`,
+			`restorePushUrls ${JSON.stringify([["git@push:me/data.git"]])}`,
+		]);
+	});
+	test("a failed push removes an origin that did not exist before", async () => {
+		const s = setup({ git: { publish: async () => Promise.reject(new Error("git push failed: rejected")) } });
+		await assert.rejects(call(s, "connectRemote", { url: URL }));
+		assert.deepEqual(s.calls.slice(-2), [`setRemote ${JSON.stringify([URL])}`, "removeRemote"]);
 	});
 });

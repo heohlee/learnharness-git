@@ -1,4 +1,6 @@
 /** Plugin backend logic: serialized git operations, automatic sync and JSON handlers. */
+
+import { sensitiveFiles } from "./format.ts";
 import { ConflictError, type Git, type RepoState } from "./git.ts";
 import { DEFAULT_SETTINGS, formatCommitMessage, mergeSettings, type Settings, type SettingsStore } from "./settings.ts";
 
@@ -18,6 +20,8 @@ export interface State {
 	/** When the next automatic sync fires, or null when automation is off. */
 	nextSync: string | null;
 	lastError: string | null;
+	/** URL of origin, or null when no remote is configured. */
+	remote: string | null;
 	settings: Settings;
 }
 
@@ -35,6 +39,21 @@ function paths(input: unknown): string[] {
 		throw new Error("paths must be a list of file paths.");
 	}
 	return value;
+}
+
+/** A remote URL safe to hand to git: no options, no spaces, no embedded password or token. */
+function remoteUrl(input: unknown): string {
+	const raw = record(input).url;
+	const url = typeof raw === "string" ? raw.trim() : "";
+	if (!url) throw new Error("Remote URL must not be empty.");
+	if (/\s/.test(url)) throw new Error("Remote URL must not contain spaces.");
+	if (url.startsWith("-")) throw new Error("Remote URL must not start with “-”.");
+	const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@]*)@/i.exec(url)?.[1] ?? "";
+	const looksLikeToken = /^(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)/i.test(userinfo);
+	if (userinfo.includes(":") || looksLikeToken || /[?&][^=]*token=/i.test(url)) {
+		throw new Error("Do not put a password or token in the remote URL. Use SSH or a Git credential helper.");
+	}
+	return url;
 }
 
 function filePath(input: unknown): string {
@@ -57,6 +76,7 @@ export function createService(deps: {
 		lastSync: null,
 		nextSync: null,
 		lastError: null,
+		remote: null,
 		settings: { ...DEFAULT_SETTINGS },
 	};
 	let loaded: Promise<void> | null = null;
@@ -160,7 +180,10 @@ export function createService(deps: {
 		state: async () => {
 			await ensureLoaded();
 			// rev-parse is read-only; refresh so views see a repository created or removed outside the plugin.
-			if (!state.busy) state.repo = await git.repoState();
+			if (!state.busy) {
+				state.repo = await git.repoState();
+				state.remote = state.repo.kind === "repo" ? await git.remoteUrl() : null;
+			}
 			return snapshot();
 		},
 		saveSettings: (input) =>
@@ -203,6 +226,47 @@ export function createService(deps: {
 			state.lastSync = clock.now().toISOString();
 			return { committed, pull: pullResult, push: pushResult };
 		}),
+		previewRemote: async (input) => {
+			const url = remoteUrl(input);
+			return exclusive(
+				"preview remote",
+				async () => {
+					await requireRepo();
+					const files = await git.listFiles();
+					// The first push uploads the branch's whole history, not only the current files.
+					const { branch } = await git.status();
+					const history = branch === null ? [] : await git.historyFiles(branch);
+					const everything = [...new Set([...files, ...history])];
+					return { url, files: files.length, sensitive: sensitiveFiles(everything) };
+				},
+				read,
+			);
+		},
+		connectRemote: async (input) => {
+			const url = remoteUrl(input);
+			return exclusive("connect remote", async () => {
+				await requireRepo();
+				const { branch } = await git.status();
+				if (branch === null) throw new Error("Check out a branch before connecting a remote.");
+				await git.commit(message(), { all: true });
+				const previous = await git.remoteUrl();
+				const previousPush = await git.pushUrls();
+				await git.setRemote(url);
+				try {
+					await git.publish(branch);
+				} catch (error) {
+					// Leave origin as it was, so Sync keeps using the remote that worked.
+					if (previous === null) await git.removeRemote();
+					else {
+						if (previous !== url) await git.setRemote(previous);
+						await git.restorePushUrls(previousPush);
+					}
+					throw error;
+				}
+				state.remote = url;
+				return { remote: url };
+			});
+		},
 		userName: inRepo("user name", () => git.userName(), read),
 		log: inRepo(
 			"log",

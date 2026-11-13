@@ -176,6 +176,10 @@ export function createGit(run: GitRunner, cwd: string) {
 	}
 	// Paths are file names, never globs: "a[1].json" must not also match "a1.json".
 	const LITERAL = "--literal-pathspecs";
+	async function remoteUrl(): Promise<string | null> {
+		const result = await run(["remote", "get-url", "origin"], { cwd });
+		return result.code === 0 ? result.stdout.trim() : null;
+	}
 	async function status(): Promise<Status> {
 		return parseStatus((await exec(["status", "--porcelain=v1", "--branch", "-z", "-uall"])).stdout);
 	}
@@ -235,6 +239,43 @@ export function createGit(run: GitRunner, cwd: string) {
 			if (current.ahead === 0 && !current.upstreamGone) return "up-to-date";
 			await exec(["push"]);
 			return "pushed";
+		},
+		remoteUrl,
+		/** Points origin at `url`, adding it when missing, and drops any push URL so pushes go to `url` too. */
+		async setRemote(url: string): Promise<void> {
+			await exec(
+				(await remoteUrl()) === null ? ["remote", "add", "origin", url] : ["remote", "set-url", "origin", url],
+			);
+			const args = ["config", "--unset-all", "remote.origin.pushurl"];
+			const result = await run(args, { cwd });
+			// Exit 5: no push URL was set.
+			if (result.code !== 0 && result.code !== 5) throw new GitError(args, result);
+		},
+		/** Origin's configured push URLs; empty when pushes use the fetch URL. */
+		async pushUrls(): Promise<string[]> {
+			const result = await run(["config", "--get-all", "remote.origin.pushurl"], { cwd });
+			return result.code === 0 ? result.stdout.split("\n").filter(Boolean) : [];
+		},
+		async restorePushUrls(urls: readonly string[]): Promise<void> {
+			for (const url of urls) await exec(["config", "--add", "remote.origin.pushurl", url]);
+		},
+		async removeRemote(): Promise<void> {
+			await exec(["remote", "remove", "origin"]);
+		},
+		/** Every path the history of `branch` ever touched; a push uploads all of them. */
+		async historyFiles(branch: string): Promise<string[]> {
+			if ((await revision(branch)) === null) return [];
+			const args = ["-c", "core.quotePath=false", "log", branch, "--name-only", "--format=", "-z"];
+			return [...new Set((await exec(args)).stdout.split(/[\0\n]/).filter(Boolean))];
+		},
+		/** First push of `branch` to origin, recording it as the upstream. */
+		async publish(branch: string): Promise<void> {
+			await exec(["push", "-u", "origin", branch]);
+		},
+		/** Files a commit of everything would include: tracked plus untracked, non-ignored. */
+		async listFiles(): Promise<string[]> {
+			const args = ["-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"];
+			return (await exec(args)).stdout.split("\0").filter(Boolean);
 		},
 		/** The configured `user.name`, or null when it is unset or cannot be read. */
 		async userName(): Promise<string | null> {

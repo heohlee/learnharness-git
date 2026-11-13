@@ -4,6 +4,7 @@ import type { State } from "./service.ts";
 import { mountDashboard } from "./ui/dashboard.ts";
 import { mountHistory } from "./ui/history.ts";
 import { DASHBOARD_VIEW, HISTORY_VIEW } from "./ui/live.ts";
+import { remoteRow } from "./ui/remote.ts";
 
 const ICON =
 	'<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 8v8M18 10c0 4-6 3-10 6"/></svg>';
@@ -58,11 +59,15 @@ export function activate(ctx: PluginFrontendContext): void {
 }
 
 function registerSettings(ctx: PluginFrontendContext): void {
+	let current: State | null = null;
 	let settings: State["settings"] | null = null;
-	const save = (key: string) => async (value: unknown) => {
-		const state = await ctx.call<State>("saveSettings", { [key]: value });
+	const accept = (state: State) => {
+		current = state;
 		settings = state.settings;
 		handle.update({ rows: rows() });
+	};
+	const save = (key: string) => async (value: unknown) => {
+		accept(await ctx.call<State>("saveSettings", { [key]: value }));
 	};
 	const rows = (): PluginSettingsRow[] => {
 		const s = settings;
@@ -110,6 +115,7 @@ function registerSettings(ctx: PluginFrontendContext): void {
 				validate: (v) => (v.trim() ? undefined : "The template must not be empty."),
 				onChange: save("commitMessage"),
 			},
+			remoteRow(ctx, current, accept),
 		];
 	};
 	const handle = ctx.registerSettings({ rows: rows() });
@@ -117,9 +123,7 @@ function registerSettings(ctx: PluginFrontendContext): void {
 		ctx
 			.call<State>("state")
 			.then((state) => {
-				if (ctx.signal.aborted) return;
-				settings = state.settings;
-				handle.update({ rows: rows() });
+				if (!ctx.signal.aborted) accept(state);
 			})
 			.catch(() => {});
 	ctx.cleanup(ctx.onResync(load));

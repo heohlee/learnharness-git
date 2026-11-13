@@ -9,6 +9,7 @@ import {
 	diffMarkdown,
 	plural,
 	relativeTime,
+	sensitiveFiles,
 	shortTime,
 } from "../src/format.ts";
 import type { Status } from "../src/git.ts";
@@ -162,4 +163,18 @@ describe("backupDetails", () => {
 			"next automatic sync in 1 min",
 		);
 	});
+});
+
+test("sensitiveFiles flags the app's root settings and token or API key files", () => {
+	assert.deepEqual(
+		sensitiveFiles([
+			"settings.json",
+			"graph/nodes.jsonl",
+			"plugins/x/data/settings.json",
+			"notes/auth-token.json",
+			"MyApiKey.txt",
+			"chats/chat_1.json",
+		]),
+		["settings.json", "notes/auth-token.json", "MyApiKey.txt"],
+	);
 });

@@ -372,3 +372,77 @@ describe("userName", () => {
 		}
 	});
 });
+
+describe("remote", () => {
+	const GET_URL = ["remote", "get-url", "origin"];
+	const GET_PUSH = ["config", "--get-all", "remote.origin.pushurl"];
+	const UNSET_PUSH = ["config", "--unset-all", "remote.origin.pushurl"];
+	test("remoteUrl returns origin's URL, or null without origin", async () => {
+		const fake = fakeGit([
+			{ args: GET_URL, result: { stdout: "git@host:me/data.git\n" } },
+			{ args: GET_URL, result: { code: 2, stderr: "error: No such remote 'origin'" } },
+		]);
+		const git = createGit(fake.run, dir);
+		assert.equal(await git.remoteUrl(), "git@host:me/data.git");
+		assert.equal(await git.remoteUrl(), null);
+	});
+	test("setRemote adds origin, or changes its URL, and drops any push URL", async () => {
+		const fake = fakeGit([
+			{ args: GET_URL, result: { code: 2 } },
+			{ args: ["remote", "add", "origin", "git@host:me/data.git"] },
+			{ args: UNSET_PUSH, result: { code: 5 } },
+			{ args: GET_URL, result: { stdout: "old\n" } },
+			{ args: ["remote", "set-url", "origin", "git@host:me/data.git"] },
+			{ args: UNSET_PUSH },
+		]);
+		const git = createGit(fake.run, dir);
+		await git.setRemote("git@host:me/data.git");
+		await git.setRemote("git@host:me/data.git");
+		fake.done();
+	});
+	test("pushUrls lists origin's push URLs, none when unset, and restorePushUrls adds them back", async () => {
+		const fake = fakeGit([
+			{ args: GET_PUSH, result: { code: 1 } },
+			{ args: GET_PUSH, result: { stdout: "a\nb\n" } },
+			{ args: ["config", "--add", "remote.origin.pushurl", "a"] },
+			{ args: ["config", "--add", "remote.origin.pushurl", "b"] },
+		]);
+		const git = createGit(fake.run, dir);
+		assert.deepEqual(await git.pushUrls(), []);
+		assert.deepEqual(await git.pushUrls(), ["a", "b"]);
+		await git.restorePushUrls(["a", "b"]);
+		fake.done();
+	});
+	test("publish pushes the branch and sets its upstream", async () => {
+		const fake = fakeGit([{ args: ["push", "-u", "origin", "main"] }]);
+		await createGit(fake.run, dir).publish("main");
+		fake.done();
+	});
+	test("listFiles lists tracked and untracked, non-ignored files", async () => {
+		const fake = fakeGit([
+			{
+				args: ["-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+				result: { stdout: "settings.json\0graph/nodes.jsonl\0" },
+			},
+		]);
+		assert.deepEqual(await createGit(fake.run, dir).listFiles(), ["settings.json", "graph/nodes.jsonl"]);
+	});
+	const HISTORY = ["-c", "core.quotePath=false", "log", "main", "--name-only", "--format=", "-z"];
+	test("historyFiles lists every path the branch history touched, once", async () => {
+		const fake = fakeGit([
+			{ args: ["rev-parse", "-q", "--verify", "main"], result: { stdout: "aaa\n" } },
+			{ args: HISTORY, result: { stdout: "settings.json\0a.json\0\n\na.json\0b c.json\0" } },
+		]);
+		assert.deepEqual(await createGit(fake.run, dir).historyFiles("main"), ["settings.json", "a.json", "b c.json"]);
+	});
+	test("historyFiles is empty for a branch without commits", async () => {
+		const fake = fakeGit([{ args: ["rev-parse", "-q", "--verify", "main"], result: { code: 1 } }]);
+		assert.deepEqual(await createGit(fake.run, dir).historyFiles("main"), []);
+		fake.done();
+	});
+	test("removeRemote removes origin", async () => {
+		const fake = fakeGit([{ args: ["remote", "remove", "origin"] }]);
+		await createGit(fake.run, dir).removeRemote();
+		fake.done();
+	});
+});

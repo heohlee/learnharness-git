@@ -158,6 +158,30 @@
 		align-items: stretch;
 	}
 }
+
+/* Remote confirmation dialog. */
+.lhgit-confirm {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	max-width: 34rem;
+}
+.lhgit-confirm p {
+	margin: 0;
+}
+.lhgit-warning {
+	color: var(--destructive);
+	font-weight: 500;
+}
+.lhgit-sensitive {
+	margin: 0;
+	padding-left: 1.25rem;
+}
+.lhgit-buttons {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+}
 .lhgit-note:empty {
 	display: none;
 }
