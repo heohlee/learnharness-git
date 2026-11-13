@@ -52,8 +52,8 @@ jobs:
       - name: Package contents
         run: npm pack --dry-run
 
-      # kit:local ci-steps
-      # /kit:local ci-steps
+      # local: ci-steps
+      # /local: ci-steps
 
   ci:
     name: CI

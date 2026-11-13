@@ -31,8 +31,8 @@ body:
       description: List the steps to reproduce the problem, including relevant inputs, commands, or URLs.
     validations:
       required: true
-  # kit:local fields
-  # /kit:local fields
+  # local: fields
+  # /local: fields
   - type: textarea
     id: context
     attributes:
