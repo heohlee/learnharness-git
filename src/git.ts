@@ -202,6 +202,37 @@ export function parseLog(stdout: string): Commit[] {
 	return commits;
 }
 
+/** Files Initialize adds to a new repository, each only when it does not exist yet. */
+export const DEFAULT_REPO_FILES: readonly { name: string; content: string }[] = [
+	{
+		name: ".gitignore",
+		content: [
+			"# Automatic graph copies: Git already keeps every version of graph/.",
+			"graph-backup-*/",
+			"# Usage log of the built-in plugins: nothing reads it.",
+			"core-plugin-data/*/usage.jsonl",
+			"# Community plugin code; keep only each plugin's data/ (its settings).",
+			"plugins/*/*",
+			"!plugins/*/data/",
+			"# Graph layout: rewritten whenever the graph is opened, and recomputed if missing.",
+			"graph/positions.json",
+			"",
+		].join("\n"),
+	},
+	{ name: ".gitattributes", content: "graph/*.jsonl merge=union\n" },
+];
+
+/** Creates `name` exclusively; an existing file or symlink is left untouched. */
+function writeIfMissing(dir: string, name: string, content: string): void {
+	try {
+		fs.writeFileSync(path.join(dir, name), content, { flag: "wx" });
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "EEXIST") return;
+		throw new Error(`Repository created, but ${name} could not be written (${code ?? String(error)}). Add it by hand.`);
+	}
+}
+
 export function createGit(run: GitRunner, cwd: string) {
 	async function fail(args: readonly string[], result: GitResult): Promise<never> {
 		if (AUTH_FAILURE.test(result.stderr)) throw new AuthError(await remoteUrl(), result.stderr.trim());
@@ -249,8 +280,10 @@ export function createGit(run: GitRunner, cwd: string) {
 			const topLevel = result.stdout.trim();
 			return path.resolve(topLevel) === path.resolve(cwd) ? { kind: "repo" } : { kind: "nested", topLevel };
 		},
+		/** `git init`, then the default .gitignore and .gitattributes where missing. Clone does not use this. */
 		async init(): Promise<void> {
 			await exec(["init", "-b", "main"]);
+			for (const file of DEFAULT_REPO_FILES) writeIfMissing(cwd, file.name, file.content);
 		},
 		/** Clones `url` into the data directory in place; `now` names the backup folder. */
 		clone(url: string, now: Date): Promise<CloneResult> {
