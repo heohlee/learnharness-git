@@ -66,5 +66,5 @@ jobs:
       - name: Audit
         run: npm audit --audit-level=high
 
-      # kit:local security-steps
-      # /kit:local security-steps
+      # local: security-steps
+      # /local: security-steps

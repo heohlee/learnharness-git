@@ -11,8 +11,8 @@
 <!-- List commands and checks actually completed, with results. Required CI checks (none when the list is empty):
 - `CI` (`.github/workflows/ci.yml`): aggregates `Checks (Node ...)`: tests with the coverage minimum, type check, lint and format, and package contents.
 -->
-<!-- kit:local verification -->
-<!-- /kit:local verification -->
+<!-- local: verification -->
+<!-- /local: verification -->
 
 ## Not verified
 

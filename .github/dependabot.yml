@@ -18,5 +18,5 @@ updates:
 
   # Stack ecosystems (gomod, npm, docker, ...) go below, one list entry each,
   # indented like the github-actions entry above. Stack module READMEs give the entry.
-  # kit:local ecosystems
-  # /kit:local ecosystems
+  # local: ecosystems
+  # /local: ecosystems

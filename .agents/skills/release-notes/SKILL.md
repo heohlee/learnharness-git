@@ -37,15 +37,15 @@ Use when drafting or revising release text. Do not use for bumping versions, bui
 3. Select only applicable sections. Read `assets/examples.md` for hypothetical formatting, never factual claims.
 4. Finish with a real Full changelog comparison when a previous release exists, then one Documentation link line (`https://github.com/heohlee/learnharness-git#readme`). Pin links to verified source refs. Do not add a Documentation section.
 
-<!-- kit:local links -->
-<!-- /kit:local links -->
+<!-- local: links -->
+<!-- /local: links -->
 
 ## Output Contract
 
 Return the version-only title and Markdown body, plus a separate private evidence summary: target/range, change sources and unresolved facts or links. Keep that summary out of the public text. Never claim publication.
 
-<!-- kit:local publication -->
-<!-- /kit:local publication -->
+<!-- local: publication -->
+<!-- /local: publication -->
 
 ## References
 

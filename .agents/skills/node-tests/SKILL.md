@@ -35,8 +35,8 @@ Do not use for passive documentation or release copy with no test-behavior impac
 8. **Bounded asynchrony.** Await promises and fake events. Do not wait on real timers with fixed sleeps; advance the fake clock. Every fake socket, server or child is closed in cleanup so `node --test` exits.
 9. **Type stripping limits.** When the project uses TypeScript without a build step, Node only erases types, so source and tests must not use `enum`, `namespace`, constructor parameter properties (`constructor(private x)`), or other syntax that needs transformation. Import peer dependencies that are not installed at test time with `import type` only. Use explicit `.ts` extensions in relative imports.
 
-<!-- kit:local test-rules -->
-<!-- /kit:local test-rules -->
+<!-- local: test-rules -->
+<!-- /local: test-rules -->
 
 ## Decision Gates
 
@@ -67,5 +67,5 @@ Paths below are repository-relative.
 
 - `tests/`: test files and shared fakes
 - `.github/workflows/`: the gates CI runs
-<!-- kit:local references -->
-<!-- /kit:local references -->
+<!-- local: references -->
+<!-- /local: references -->
