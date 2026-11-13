@@ -355,3 +355,20 @@ describe("log", () => {
 		]);
 	});
 });
+
+describe("userName", () => {
+	const CONFIG = ["config", "user.name"];
+	test("returns the configured user name", async () => {
+		const fake = fakeGit([{ args: CONFIG, result: { stdout: "Ada Lovelace\n" } }]);
+		assert.equal(await createGit(fake.run, dir).userName(), "Ada Lovelace");
+		assert.deepEqual(fake.calls, [{ args: CONFIG, cwd: dir }]);
+		fake.done();
+	});
+	test("returns null when no user name is set or git fails", async () => {
+		for (const result of [{ code: 1 }, { code: 0, stdout: "  \n" }, { code: 128, stderr: "fatal: bad config" }]) {
+			const fake = fakeGit([{ args: CONFIG, result }]);
+			assert.equal(await createGit(fake.run, dir).userName(), null);
+			fake.done();
+		}
+	});
+});

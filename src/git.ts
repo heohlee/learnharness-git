@@ -236,6 +236,12 @@ export function createGit(run: GitRunner, cwd: string) {
 			await exec(["push"]);
 			return "pushed";
 		},
+		/** The configured `user.name`, or null when it is unset or cannot be read. */
+		async userName(): Promise<string | null> {
+			const result = await run(["config", "user.name"], { cwd });
+			const name = result.stdout.trim();
+			return result.code === 0 && name ? name : null;
+		},
 		async log(limit: number): Promise<Commit[]> {
 			if ((await revision("HEAD")) === null) return [];
 			const format = "--format=%x1e%H%x1f%h%x1f%an%x1f%aI%x1f%s";
