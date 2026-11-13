@@ -105,3 +105,14 @@ export function backupDetails(
 	if (input.status) parts.push(describeBranch(input.status));
 	return parts;
 }
+
+/**
+ * Files worth a second look before pushing: the app's root settings (model configuration)
+ * and any file whose name mentions a token or an API key.
+ */
+export function sensitiveFiles(paths: readonly string[]): string[] {
+	return paths.filter((file) => {
+		const name = file.slice(file.lastIndexOf("/") + 1).toLowerCase();
+		return file === "settings.json" || name.includes("token") || name.replace(/[-_]/g, "").includes("apikey");
+	});
+}
