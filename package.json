@@ -18,7 +18,8 @@
 		"coverage": "node --test --experimental-test-coverage --test-coverage-include=\"src/**\" --test-coverage-exclude=\"src/backend.ts\" --test-coverage-exclude=\"src/main.ts\" --test-coverage-exclude=\"src/ui/**\" --test-coverage-lines=85 --test-coverage-branches=85 --test-coverage-functions=85 \"tests/**/*.test.ts\"",
 		"typecheck": "tsc --noEmit",
 		"lint": "biome ci .",
-		"lint:fix": "biome check --write ."
+		"lint:fix": "biome check --write .",
+		"package": "npm run build && node scripts/package.mjs"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.6.7",
