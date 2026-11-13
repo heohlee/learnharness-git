@@ -156,6 +156,12 @@ describe("clone in place", () => {
 			"sources: x",
 		]);
 	});
+	test("does not write a default .gitignore or .gitattributes", async () => {
+		const { fake, git } = scripted([...remoteSetup("main", ["a.md"]), { args: checkout("main") }]);
+		await git.clone(URL, NOW);
+		fake.done();
+		assert.deepEqual(await snapshot(), [".git/", ".git/info/", ".git/info/exclude: .learnharness-git-backup/\n"]);
+	});
 	test("appends the exclude line after existing exclude rules", async () => {
 		const { fake, git } = scripted([...remoteSetup("main", ["a.md"]), { args: checkout("main") }]);
 		await fs.mkdir(path.join(dir, ".git", "info"), { recursive: true });

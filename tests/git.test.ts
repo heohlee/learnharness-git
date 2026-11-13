@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { AuthError, ConflictError, createGit, GitError } from "../src/git.ts";
 import { fakeGit } from "./fake-git.ts";
 
@@ -109,10 +109,78 @@ describe("stage, unstage, init", () => {
 		await git.unstage([]);
 		fake.done();
 	});
-	test("init creates a repository on branch main", async () => {
+});
+
+describe("init", () => {
+	const GITIGNORE = [
+		"# Automatic graph copies: Git already keeps every version of graph/.",
+		"graph-backup-*/",
+		"# Usage log of the built-in plugins: nothing reads it.",
+		"core-plugin-data/*/usage.jsonl",
+		"# Community plugin code; keep only each plugin's data/ (its settings).",
+		"plugins/*/*",
+		"!plugins/*/data/",
+		"# Graph layout: rewritten whenever the graph is opened, and recomputed if missing.",
+		"graph/positions.json",
+		"",
+	].join("\n");
+	const GITATTRIBUTES = "graph/*.jsonl merge=union\n";
+	let tmp = "";
+	beforeEach(async () => {
+		tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-init-"));
+	});
+	afterEach(async () => {
+		await fs.rm(tmp, { recursive: true, force: true });
+	});
+	const read = (file: string) => fs.readFile(path.join(tmp, file), "utf8");
+
+	test("creates a repository on branch main and writes the default .gitignore and .gitattributes", async () => {
 		const fake = fakeGit([{ args: ["init", "-b", "main"] }]);
-		await createGit(fake.run, dir).init();
+		await createGit(fake.run, tmp).init();
 		fake.done();
+		assert.deepEqual(fake.calls, [{ args: ["init", "-b", "main"], cwd: tmp }]);
+		assert.deepEqual((await fs.readdir(tmp)).sort(), [".gitattributes", ".gitignore"]);
+		assert.equal(await read(".gitignore"), GITIGNORE);
+		assert.equal(await read(".gitattributes"), GITATTRIBUTES);
+	});
+	test("leaves an existing .gitignore byte-identical and still writes .gitattributes", async () => {
+		await fs.writeFile(path.join(tmp, ".gitignore"), "mine\r\nno newline");
+		const fake = fakeGit([{ args: ["init", "-b", "main"] }]);
+		await createGit(fake.run, tmp).init();
+		fake.done();
+		assert.equal(await read(".gitignore"), "mine\r\nno newline");
+		assert.equal(await read(".gitattributes"), GITATTRIBUTES);
+	});
+	test("leaves an existing .gitattributes byte-identical and still writes .gitignore", async () => {
+		await fs.writeFile(path.join(tmp, ".gitattributes"), "");
+		const fake = fakeGit([{ args: ["init", "-b", "main"] }]);
+		await createGit(fake.run, tmp).init();
+		fake.done();
+		assert.equal(await read(".gitattributes"), "");
+		assert.equal(await read(".gitignore"), GITIGNORE);
+	});
+	test("a symlink counts as existing and is not followed", async () => {
+		await fs.symlink("missing-target", path.join(tmp, ".gitignore"));
+		const fake = fakeGit([{ args: ["init", "-b", "main"] }]);
+		await createGit(fake.run, tmp).init();
+		fake.done();
+		assert.equal(await fs.readlink(path.join(tmp, ".gitignore")), "missing-target");
+		assert.deepEqual((await fs.readdir(tmp)).sort(), [".gitattributes", ".gitignore"]);
+	});
+	test("a failed git init writes nothing", async () => {
+		const fake = fakeGit([{ args: ["init", "-b", "main"], result: { code: 1, stderr: "fatal: nope" } }]);
+		await assert.rejects(createGit(fake.run, tmp).init(), { message: "git init failed: fatal: nope" });
+		fake.done();
+		assert.deepEqual(await fs.readdir(tmp), []);
+	});
+	test("a failed write reports which file is missing after the repository was created", async () => {
+		const missing = path.join(tmp, "gone");
+		const fake = fakeGit([{ args: ["init", "-b", "main"] }]);
+		await assert.rejects(createGit(fake.run, missing).init(), {
+			message: `Repository created, but .gitignore could not be written (ENOENT). Add it by hand.`,
+		});
+		fake.done();
+		assert.deepEqual(await fs.readdir(tmp), []);
 	});
 });
 
