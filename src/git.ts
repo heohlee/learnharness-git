@@ -233,6 +233,45 @@ function writeIfMissing(dir: string, name: string, content: string): void {
 	}
 }
 
+/**
+ * Plugin folders (`plugins/<id>/`) that are Git repositories themselves, holding a `.git` folder or file (a
+ * plugin installed with git clone, or a worktree or submodule). `git add -A` would commit them as embedded
+ * repositories. A symlinked folder is skipped and not followed: git stores it as a link and never looks inside.
+ */
+function nestedPluginRepos(cwd: string): string[] {
+	const plugins = path.join(cwd, "plugins");
+	if (fs.lstatSync(plugins, { throwIfNoEntry: false })?.isDirectory() !== true) return [];
+	return fs
+		.readdirSync(plugins, { withFileTypes: true })
+		.filter((entry) => {
+			if (!entry.isDirectory()) return false;
+			const dotGit = fs.lstatSync(path.join(plugins, entry.name, ".git"), { throwIfNoEntry: false });
+			return dotGit?.isDirectory() === true || dotGit?.isFile() === true;
+		})
+		.map((entry) => entry.name)
+		.sort();
+}
+
+/** Exclude pattern matching only the folder `plugins/<id>/`, with glob characters in `id` taken literally. */
+const pluginPattern = (id: string) => `/plugins/${id.replace(/[\\*?[]/g, "\\$&")}/`;
+
+const BLOCK_START = "# learnharness-git: plugins installed with git clone\n";
+const BLOCK_END = "# end learnharness-git\n";
+
+/** Rewrites only the plugin's marked block in `file` to hold `lines` (none: no block); the rest stays byte-identical. */
+function writeExcludeBlock(file: string, lines: readonly string[]): void {
+	const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+	const padded = `\n${current}`;
+	const start = padded.indexOf(`\n${BLOCK_START}`);
+	const end = start < 0 ? -1 : padded.indexOf(`\n${BLOCK_END}`, start + BLOCK_START.length);
+	const [head, tail] = end < 0 ? [current, ""] : [current.slice(0, start), current.slice(end + BLOCK_END.length)];
+	const block = lines.length ? `${BLOCK_START}${lines.map((line) => `${line}\n`).join("")}${BLOCK_END}` : "";
+	const next = `${head}${block && head && !head.endsWith("\n") ? "\n" : ""}${block}${tail}`;
+	if (next === current) return;
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, next);
+}
+
 export function createGit(run: GitRunner, cwd: string) {
 	async function fail(args: readonly string[], result: GitResult): Promise<never> {
 		if (AUTH_FAILURE.test(result.stderr)) throw new AuthError(await remoteUrl(), result.stderr.trim());
@@ -268,6 +307,37 @@ export function createGit(run: GitRunner, cwd: string) {
 		const result = await run(["remote", "get-url", "origin"], { cwd });
 		return result.code === 0 ? result.stdout.trim() : null;
 	}
+	/**
+	 * Keeps the nested plugin repositories, and only them, in a marked block of the repository's own exclude file
+	 * (never .gitignore), so no status, stage or commit picks them up and a plugin reinstalled normally is backed
+	 * up again. A file that cannot be written stops the caller before git runs.
+	 */
+	async function excludeNestedRepos(): Promise<void> {
+		const ids = nestedPluginRepos(cwd);
+		const broken = ids.find((id) => /[\r\n]/.test(id));
+		if (broken !== undefined) {
+			const folder = JSON.stringify(`plugins/${broken}/`);
+			throw new Error(
+				`Could not keep ${folder} (its own Git repository) out of the backup: its name has a line break. Rename the folder.`,
+			);
+		}
+		const dotGit = fs.lstatSync(path.join(cwd, ".git"), { throwIfNoEntry: false });
+		if (ids.length === 0 && dotGit?.isFile() !== true) {
+			// A plain .git folder: drop a stale block without asking git. No .git at all: nothing to reconcile.
+			if (dotGit?.isDirectory() === true) writeExcludeBlock(path.join(cwd, ".git", "info", "exclude"), []);
+			return;
+		}
+		// Worktrees and custom git dirs keep the exclude file elsewhere: ask git where it is.
+		const file = (await exec(["rev-parse", "--git-path", "info/exclude"])).stdout.replace(/\r?\n$/, "");
+		try {
+			writeExcludeBlock(path.resolve(cwd, file), ids.map(pluginPattern));
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code ?? String(error);
+			const folders = ids.map((id) => `plugins/${id}/`).join(", ") || "plugins installed with git clone";
+			const own = ids.length === 1 ? "its own Git repository" : "each its own Git repository";
+			throw new Error(`Could not keep ${folders} (${own}) out of the backup: ${file} could not be written (${code}).`);
+		}
+	}
 	async function status(): Promise<Status> {
 		return parseStatus((await exec(["status", "--porcelain=v1", "--branch", "-z", "-uall"])).stdout);
 	}
@@ -284,13 +354,18 @@ export function createGit(run: GitRunner, cwd: string) {
 		async init(): Promise<void> {
 			await exec(["init", "-b", "main"]);
 			for (const file of DEFAULT_REPO_FILES) writeIfMissing(cwd, file.name, file.content);
+			await excludeNestedRepos();
 		},
 		/** Clones `url` into the data directory in place; `now` names the backup folder. */
 		clone(url: string, now: Date): Promise<CloneResult> {
 			return cloneInPlace({ exec, run: (args) => run(args, { cwd }) }, cwd, url, now);
 		},
-		status,
+		async status(): Promise<Status> {
+			await excludeNestedRepos();
+			return status();
+		},
 		async stage(paths: readonly string[]): Promise<void> {
+			await excludeNestedRepos();
 			await exec(paths.length ? [LITERAL, "add", "-A", "--", ...paths] : [LITERAL, "add", "-A"]);
 		},
 		async unstage(paths: readonly string[]): Promise<void> {
@@ -305,6 +380,7 @@ export function createGit(run: GitRunner, cwd: string) {
 		async commit(message: string, options: { all: boolean }): Promise<{ committed: boolean }> {
 			if (!message.trim()) throw new Error("Commit message is empty.");
 			await refuseDuringMerge();
+			await excludeNestedRepos();
 			if (options.all) await exec(["add", "-A"]);
 			const staged = await exec(["diff", "--cached", "--quiet"], [0, 1]);
 			if (staged.code === 0) return { committed: false };
@@ -392,6 +468,7 @@ export function createGit(run: GitRunner, cwd: string) {
 		},
 		/** Files a commit of everything would include: tracked plus untracked, non-ignored. */
 		async listFiles(): Promise<string[]> {
+			await excludeNestedRepos();
 			const args = ["-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"];
 			return (await exec(args)).stdout.split("\0").filter(Boolean);
 		},

@@ -88,14 +88,22 @@ export function freshBackupDir(cwd: string, base: string): string {
 	return dir;
 }
 
-/** Keeps backups out of commits through the repository's own exclude file, not a .gitignore. */
-export function excludeBackups(cwd: string): void {
-	const exclude = path.join(cwd, ".git", "info", "exclude");
+/**
+ * Appends each of `lines` missing from the exclude file `exclude`, creating it and its folder when needed.
+ * Existing content stays byte-identical; a line already present is never added twice.
+ */
+export function appendExcludes(exclude: string, lines: readonly string[]): void {
 	fs.mkdirSync(path.dirname(exclude), { recursive: true });
 	const current = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
-	const line = `${BACKUP_ROOT}/`;
-	if (current.split("\n").includes(line)) return;
-	fs.appendFileSync(exclude, `${current && !current.endsWith("\n") ? "\n" : ""}${line}\n`);
+	const present = new Set(current.split("\n"));
+	const missing = [...new Set(lines)].filter((line) => !present.has(line));
+	if (missing.length === 0) return;
+	fs.appendFileSync(exclude, `${current && !current.endsWith("\n") ? "\n" : ""}${missing.join("\n")}\n`);
+}
+
+/** Keeps backups out of commits through the repository's own exclude file, not a .gitignore. */
+export function excludeBackups(cwd: string): void {
+	appendExcludes(path.join(cwd, ".git", "info", "exclude"), [`${BACKUP_ROOT}/`]);
 }
 
 export async function cloneInPlace(git: CloneGit, cwd: string, url: string, now: Date): Promise<CloneResult> {
