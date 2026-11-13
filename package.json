@@ -1,0 +1,33 @@
+{
+	"name": "learnharness-git",
+	"version": "0.1.0",
+	"description": "LearnHarness plugin that versions the learning data with Git.",
+	"private": true,
+	"type": "module",
+	"license": "AGPL-3.0-only",
+	"engines": {
+		"node": ">=24"
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "node scripts/build.mjs",
+		"install:local": "npm run build && node scripts/install-plugin-local.mjs",
+		"test": "node --test \"tests/**/*.test.ts\"",
+		"coverage": "node --test --experimental-test-coverage --test-coverage-include=\"src/**\" --test-coverage-exclude=\"src/backend.ts\" --test-coverage-exclude=\"src/main.ts\" --test-coverage-exclude=\"src/ui/**\" --test-coverage-lines=85 --test-coverage-branches=85 --test-coverage-functions=85 \"tests/**/*.test.ts\"",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome ci .",
+		"lint:fix": "biome check --write ."
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.6.7",
+		"@earendil-works/pi-agent-core": "1.4.0",
+		"@earendil-works/pi-ai": "1.4.0",
+		"@types/node": "24.13.3",
+		"esbuild": "0.28.2",
+		"learnharness-plugin-api": "file:.sdk",
+		"typebox": "1.4.3",
+		"typescript": "5.9.3"
+	}
+}
