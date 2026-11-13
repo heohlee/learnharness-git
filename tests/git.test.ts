@@ -621,3 +621,166 @@ describe("authentication failures", () => {
 		fake.done();
 	});
 });
+
+describe("plugins installed with git clone (nested repositories)", () => {
+	const GIT_PATH = ["rev-parse", "--git-path", "info/exclude"];
+	const EXCLUDE = ".git/info/exclude";
+	const block = (...ids: string[]) =>
+		`# learnharness-git: plugins installed with git clone\n${ids.map((id) => `/plugins/${id}/\n`).join("")}# end learnharness-git\n`;
+	let tmp = "";
+	beforeEach(async () => {
+		tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-nested-"));
+	});
+	afterEach(async () => {
+		await fs.rm(tmp, { recursive: true, force: true });
+	});
+	const read = (file: string) => fs.readFile(path.join(tmp, file), "utf8");
+	const exists = (file: string) =>
+		fs.lstat(path.join(tmp, file)).then(
+			() => true,
+			() => false,
+		);
+	/** plugins/<id>/ with a `.git` folder (a clone) or a `.git` file (a worktree or submodule). */
+	async function plugin(id: string, git: "dir" | "file" | null): Promise<void> {
+		await fs.mkdir(path.join(tmp, "plugins", id, "data"), { recursive: true });
+		await fs.writeFile(path.join(tmp, "plugins", id, "data", "s.json"), "{}");
+		if (git === "dir") await fs.mkdir(path.join(tmp, "plugins", id, ".git"));
+		if (git === "file") await fs.writeFile(path.join(tmp, "plugins", id, ".git"), "gitdir: /elsewhere\n");
+	}
+	const commitAll = (gitPath: string) => [
+		...noMerge,
+		{ args: GIT_PATH, result: { stdout: `${gitPath}\n` } },
+		{ args: ["add", "-A"] },
+		{ args: ["diff", "--cached", "--quiet"], result: { code: 1 } },
+		{ args: ["commit", "-q", "-m", "msg"] },
+	];
+
+	test("commit excludes every plugin folder holding a .git folder or file, before staging", async () => {
+		await plugin("learnharness-git", "dir");
+		await plugin("worktree", "file");
+		await plugin("a[1]*?", "dir");
+		await plugin("plain", null);
+		// A symlinked plugin folder is stored by git as a symlink, never as an embedded repository.
+		await fs.mkdir(path.join(tmp, "outside", ".git"), { recursive: true });
+		await fs.symlink(path.join(tmp, "outside"), path.join(tmp, "plugins", "linked"));
+		await fs.writeFile(path.join(tmp, "plugins", "notes.txt"), "");
+		const fake = fakeGit(commitAll(EXCLUDE));
+		assert.deepEqual(await createGit(fake.run, tmp).commit("msg", { all: true }), { committed: true });
+		fake.done();
+		assert.deepEqual(
+			fake.calls.map((c) => c.args),
+			commitAll(EXCLUDE).map((c) => c.args),
+		);
+		assert.equal(await read(EXCLUDE), block("a\\[1]\\*\\?", "learnharness-git", "worktree"));
+		assert.equal(await read(".gitignore").catch(() => null), null);
+	});
+	test("keeps existing exclude content byte-identical and writes the block once across commits", async () => {
+		await plugin("learnharness-git", "dir");
+		await plugin("other", "dir");
+		await fs.mkdir(path.join(tmp, ".git", "info"), { recursive: true });
+		await fs.writeFile(path.join(tmp, EXCLUDE), "# mine\r\n/plugins/other/\n.learnharness-git-backup/");
+		const fake = fakeGit([...commitAll(EXCLUDE), ...commitAll(EXCLUDE)]);
+		const git = createGit(fake.run, tmp);
+		await git.commit("msg", { all: true });
+		const once = await read(EXCLUDE);
+		await fs.chmod(path.join(tmp, EXCLUDE), 0o444); // an unchanged block is not rewritten
+		await git.commit("msg", { all: true });
+		fake.done();
+		assert.equal(once, `# mine\r\n/plugins/other/\n.learnharness-git-backup/\n${block("learnharness-git", "other")}`);
+		assert.equal(await read(EXCLUDE), once);
+	});
+	test("drops the block once no plugin is a nested repository, keeping the user's lines", async () => {
+		await plugin("learnharness-git", "dir");
+		await fs.mkdir(path.join(tmp, ".git", "info"), { recursive: true });
+		await fs.writeFile(path.join(tmp, EXCLUDE), "# mine\r\n.learnharness-git-backup/");
+		const fake = fakeGit([...commitAll(EXCLUDE), ...commitAll(EXCLUDE).filter((c) => c.args !== GIT_PATH)]);
+		const git = createGit(fake.run, tmp);
+		await git.commit("msg", { all: true });
+		// Reinstalled normally under the same name: an ordinary folder that must be backed up again.
+		await fs.rm(path.join(tmp, "plugins", "learnharness-git", ".git"), { recursive: true });
+		await git.commit("msg", { all: true });
+		fake.done();
+		assert.equal(await read(EXCLUDE), "# mine\r\n.learnharness-git-backup/\n");
+	});
+	test("in a worktree (.git file) git is asked where the stale block is", async () => {
+		await fs.writeFile(path.join(tmp, ".git"), "gitdir: common\n");
+		await fs.writeFile(path.join(tmp, "exclude"), `x\n${block("old")}`);
+		const gitPath = { args: GIT_PATH, result: { stdout: "exclude\n" } };
+		const fake = fakeGit([gitPath, { args: ["--literal-pathspecs", "add", "-A"] }]);
+		await createGit(fake.run, tmp).stage([]);
+		fake.done();
+		assert.equal(await read("exclude"), "x\n");
+	});
+	test("a plugin name with a line break stops before the exclude file or git is touched", async () => {
+		await plugin("a\nconfig.json\nb", "dir");
+		await fs.mkdir(path.join(tmp, ".git", "info"), { recursive: true });
+		await fs.writeFile(path.join(tmp, EXCLUDE), "# mine\n");
+		const fake = fakeGit(noMerge);
+		await assert.rejects(createGit(fake.run, tmp).commit("msg", { all: true }), {
+			message:
+				'Could not keep "plugins/a\\nconfig.json\\nb/" (its own Git repository) out of the backup: its name has a line break. Rename the folder.',
+		});
+		fake.done();
+		assert.equal(await read(EXCLUDE), "# mine\n");
+	});
+	test("uses the exclude file git reports (worktree git dir), creating its folder", async () => {
+		await plugin("learnharness-git", "dir");
+		const elsewhere = path.join(tmp, "common", "info", "exclude");
+		const fake = fakeGit(commitAll(elsewhere));
+		await createGit(fake.run, tmp).commit("msg", { all: true });
+		fake.done();
+		assert.equal(await fs.readFile(elsewhere, "utf8"), block("learnharness-git"));
+		assert.equal(await exists(".git"), false);
+	});
+	test("without a nested repository nothing is excluded and git is not asked", async () => {
+		await plugin("plain", null);
+		const fake = fakeGit([
+			...noMerge,
+			{ args: ["add", "-A"] },
+			{ args: ["diff", "--cached", "--quiet"], result: { code: 1 } },
+			{ args: ["commit", "-q", "-m", "msg"] },
+		]);
+		await createGit(fake.run, tmp).commit("msg", { all: true });
+		fake.done();
+		assert.equal(await exists(".git"), false);
+	});
+	test("a failed exclude write stops before anything is staged or committed", async () => {
+		await plugin("learnharness-git", "dir");
+		await plugin("other", "file");
+		// The exclude path is a folder, so it cannot be read or appended to.
+		await fs.mkdir(path.join(tmp, EXCLUDE), { recursive: true });
+		const fake = fakeGit([...noMerge, { args: GIT_PATH, result: { stdout: `${EXCLUDE}\n` } }]);
+		await assert.rejects(createGit(fake.run, tmp).commit("msg", { all: true }), {
+			message:
+				"Could not keep plugins/learnharness-git/, plugins/other/ (each its own Git repository) out of the backup: .git/info/exclude could not be written (EISDIR).",
+		});
+		fake.done();
+	});
+	test("Initialize excludes them right after creating the repository", async () => {
+		await plugin("learnharness-git", "dir");
+		const fake = fakeGit([{ args: ["init", "-b", "main"] }, { args: GIT_PATH, result: { stdout: `${EXCLUDE}\n` } }]);
+		await createGit(fake.run, tmp).init();
+		fake.done();
+		assert.equal(await read(EXCLUDE), block("learnharness-git"));
+		assert.equal((await read(".gitignore")).includes("learnharness-git"), false);
+	});
+	test("status, stage and listFiles exclude them first, so they are never listed or staged", async () => {
+		await plugin("learnharness-git", "dir");
+		const LS = ["-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"];
+		const gitPath = { args: GIT_PATH, result: { stdout: `${EXCLUDE}\n` } };
+		const fake = fakeGit([
+			gitPath,
+			{ args: STATUS, result: { stdout: "## main\0" } },
+			gitPath,
+			{ args: ["--literal-pathspecs", "add", "-A", "--", "plugins"] },
+			gitPath,
+			{ args: LS, result: { stdout: "settings.json\0" } },
+		]);
+		const git = createGit(fake.run, tmp);
+		assert.deepEqual((await git.status()).unstaged, []);
+		await git.stage(["plugins"]);
+		assert.deepEqual(await git.listFiles(), ["settings.json"]);
+		fake.done();
+		assert.equal(await read(EXCLUDE), block("learnharness-git"));
+	});
+});
