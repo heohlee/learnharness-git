@@ -1,6 +1,7 @@
 /** Git operations over an injected process runner. No real process is spawned here. */
 import fs from "node:fs";
 import path from "node:path";
+import { type CloneResult, cloneInPlace } from "./clone.ts";
 
 export interface GitResult {
 	code: number;
@@ -194,6 +195,10 @@ export function createGit(run: GitRunner, cwd: string) {
 		},
 		async init(): Promise<void> {
 			await exec(["init", "-b", "main"]);
+		},
+		/** Clones `url` into the data directory in place; `now` names the backup folder. */
+		clone(url: string, now: Date): Promise<CloneResult> {
+			return cloneInPlace({ exec, run: (args) => run(args, { cwd }) }, cwd, url, now);
 		},
 		status,
 		async stage(paths: readonly string[]): Promise<void> {

@@ -82,13 +82,20 @@ export function commitCells(
 }
 
 export function backupHeadline(
-	input: { repo: boolean; lastCommit: string | null; busy: string | null; paused: boolean },
+	input: { repo: boolean; lastCommit: string | null; busy: string | null; paused: boolean; restartRequired?: boolean },
 	now: Date,
 ): string {
 	if (input.busy) return `Running ${input.busy}…`;
+	if (input.restartRequired) return "Restart LearnHarness to finish cloning";
 	if (input.paused) return "Automatic sync paused";
 	if (!input.repo || input.lastCommit === null) return "Not backed up yet";
 	return `Backed up ${relativeTime(input.lastCommit, now)}`;
+}
+
+/** Text under the restart headline after a clone, naming the backup folder when files were moved. */
+export function cloneDetails(backupDir: string | null): string {
+	const restart = "LearnHarness loads the cloned learning data after a restart.";
+	return backupDir === null ? restart : `${restart} Local files the backup replaced were moved to ${backupDir}.`;
 }
 
 /** Secondary facts under the headline: pending changes, next sync and branch. */

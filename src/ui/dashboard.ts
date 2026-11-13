@@ -1,8 +1,9 @@
 /** Main "Git" view (artboard 03-backup-dashboard): backup status first, then pending changes. History lives in Git History. */
 import type { PluginFrontendContext, PluginTreeRow } from "learnharness-plugin-api";
-import { backupDetails, backupHeadline, changeLabel, diffMarkdown } from "../format.ts";
+import { backupDetails, backupHeadline, changeLabel, cloneDetails, diffMarkdown } from "../format.ts";
 import type { Commit, FileChange, Status } from "../git.ts";
 import type { State } from "../service.ts";
+import { openCloneDialog } from "./clone.ts";
 import { el, errorText, HISTORY_VIEW, liveRefresh } from "./live.ts";
 
 /** Only the last commit is needed: its date heads the status card. */
@@ -78,6 +79,17 @@ export function mountDashboard(ctx: PluginFrontendContext, container: HTMLElemen
 	const initButton = ctx.ui.mountButton(
 		primary,
 		{ label: "Initialize repository", size: "lg", onClick: () => void run("init") },
+		options,
+	);
+	const cloneButton = ctx.ui.mountButton(
+		primary,
+		{
+			label: "Clone from remote",
+			size: "lg",
+			variant: "outline",
+			title: "Bring your learning data from an existing backup repository",
+			onClick: () => openCloneDialog(ctx, signal),
+		},
 		options,
 	);
 	const commitButton = ctx.ui.mountButton(
@@ -174,14 +186,19 @@ export function mountDashboard(ctx: PluginFrontendContext, container: HTMLElemen
 		const changes = status ? [...status.staged, ...status.unstaged] : [];
 
 		const lastCommit = recent[0]?.date ?? null;
-		const title = backupHeadline({ repo, lastCommit, busy: state.busy, paused: state.paused }, now);
+		const title = backupHeadline(
+			{ repo, lastCommit, busy: state.busy, paused: state.paused, restartRequired: state.restartRequired },
+			now,
+		);
 		// Only the "Backed up …" headline links to the history; busy, paused and setup states stay plain text.
-		const linked = repo && lastCommit !== null && !state.busy && !state.paused;
+		const linked = repo && lastCommit !== null && !state.busy && !state.paused && !state.restartRequired;
 		if (linked) {
 			headlineLink.textContent = title;
 			if (headlineLink.parentNode !== headline) headline.replaceChildren(headlineLink);
 		} else headline.textContent = title;
-		if (!repo) {
+		if (state.restartRequired) {
+			details.textContent = cloneDetails(state.cloneBackupDir);
+		} else if (!repo) {
 			details.textContent =
 				state.repo.kind === "nested"
 					? `The learning data is inside another Git repository (${state.repo.topLevel}). Initialize a separate repository to back it up.`
@@ -201,6 +218,7 @@ export function mountDashboard(ctx: PluginFrontendContext, container: HTMLElemen
 
 		syncButton.update({ disabled: !repo || state.busy !== null });
 		initButton.update({ disabled: state.busy !== null });
+		cloneButton.update({ disabled: state.busy !== null });
 		primary.dataset.mode = repo ? "sync" : "init";
 		pending.hidden = !repo;
 		if (!repo) return;

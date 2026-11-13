@@ -46,6 +46,7 @@ function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: 
 		removeRemote: record("removeRemote", undefined),
 		pushUrls: record("pushUrls", []),
 		restorePushUrls: record("restorePushUrls", undefined),
+		clone: record("clone", { branch: "main", backupDir: ".learnharness-git-backup/x", backedUp: ["settings.json"] }),
 		...options.git,
 	} as Git;
 	const service = createService({
@@ -333,6 +334,7 @@ describe("remote", () => {
 			const s = setup();
 			await assert.rejects(call(s, "previewRemote", { url }), { message });
 			await assert.rejects(call(s, "connectRemote", { url }), { message });
+			await assert.rejects(call(s, "clone", { url }), { message });
 			assert.deepEqual(s.calls, []);
 		});
 	}
@@ -401,5 +403,62 @@ describe("remote", () => {
 		const s = setup({ git: { publish: async () => Promise.reject(new Error("git push failed: rejected")) } });
 		await assert.rejects(call(s, "connectRemote", { url: URL }));
 		assert.deepEqual(s.calls.slice(-2), [`setRemote ${JSON.stringify([URL])}`, "removeRemote"]);
+	});
+});
+
+describe("clone", () => {
+	const URL = "git@github.com:me/learning-data.git";
+	type CloneState = { repo: RepoState; remote: string | null; restartRequired: boolean; cloneBackupDir: string | null };
+	test("state starts without a pending restart", async () => {
+		const state = (await call(setup(), "state")) as CloneState;
+		assert.equal(state.restartRequired, false);
+		assert.equal(state.cloneBackupDir, null);
+	});
+	test("clones into a folder that is not a repository and asks for a restart", async () => {
+		const s = setup({ repo: { kind: "none" } });
+		assert.deepEqual(await call(s, "clone", { url: ` ${URL} ` }), {
+			branch: "main",
+			backupDir: ".learnharness-git-backup/x",
+			backedUp: ["settings.json"],
+		});
+		assert.deepEqual(s.calls, ["repoState", `clone ${JSON.stringify([URL, new Date(2026, 10, 12, 9, 30)])}`]);
+		const last = s.events.at(-1)?.data as CloneState & { busy: string | null };
+		assert.deepEqual(
+			s.events.map((event) => [event.topic, (event.data as { busy: string | null }).busy]),
+			[
+				["state", "clone"],
+				["state", null],
+			],
+		);
+		assert.deepEqual(
+			{ repo: last.repo, remote: last.remote, restartRequired: last.restartRequired, backup: last.cloneBackupDir },
+			{ repo: { kind: "repo" }, remote: URL, restartRequired: true, backup: ".learnharness-git-backup/x" },
+		);
+	});
+	test("clones into a folder nested inside another repository", async () => {
+		const s = setup({ repo: { kind: "nested", topLevel: "/home" } });
+		await call(s, "clone", { url: URL });
+		assert.deepEqual(s.calls, ["repoState", `clone ${JSON.stringify([URL, new Date(2026, 10, 12, 9, 30)])}`]);
+	});
+	test("refuses a folder that already is a repository before cloning", async () => {
+		const s = setup();
+		await assert.rejects(call(s, "clone", { url: URL }), {
+			message: "The learning data folder is already a Git repository.",
+		});
+		assert.deepEqual(s.calls, ["repoState"]);
+		const state = (await call(s, "state")) as CloneState;
+		assert.equal(state.restartRequired, false);
+	});
+	test("a failed clone records the error and asks for no restart", async () => {
+		const s = setup({
+			repo: { kind: "none" },
+			git: { clone: async () => Promise.reject(new Error("git fetch failed: denied")) },
+		});
+		await assert.rejects(call(s, "clone", { url: URL }), { message: "git fetch failed: denied" });
+		const last = s.events.at(-1)?.data as CloneState & { lastError: string };
+		assert.deepEqual(
+			{ restartRequired: last.restartRequired, lastError: last.lastError, repo: last.repo, remote: last.remote },
+			{ restartRequired: false, lastError: "git fetch failed: denied", repo: { kind: "none" }, remote: null },
+		);
 	});
 });

@@ -43,6 +43,11 @@
 	color: var(--foreground);
 	font-weight: 600;
 }
+.lhgit-primary {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+}
 /* "Backed up …" opens Git History: subtle underlined text, not a button. */
 .lhgit-headline-link {
 	all: unset;
@@ -60,6 +65,7 @@
 	border-radius: 2px;
 }
 .lhgit-primary[data-mode="sync"] > :nth-child(2),
+.lhgit-primary[data-mode="sync"] > :nth-child(3),
 .lhgit-primary[data-mode="init"] > :nth-child(1) {
 	display: none;
 }
@@ -101,6 +107,15 @@
 .lhgit-message:focus-visible {
 	outline: 2px solid var(--ring);
 	outline-offset: 1px;
+}
+.lhgit-field {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+}
+.lhgit-field > span {
+	font-size: 0.875rem;
+	font-weight: 500;
 }
 
 .lhgit-file {

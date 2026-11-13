@@ -4,6 +4,7 @@ import {
 	backupDetails,
 	backupHeadline,
 	changeLabel,
+	cloneDetails,
 	commitCells,
 	describeBranch,
 	diffMarkdown,
@@ -134,6 +135,23 @@ describe("backupHeadline", () => {
 		assert.equal(backupHeadline({ ...base, lastCommit: null }, now), "Not backed up yet");
 		assert.equal(backupHeadline({ ...base, paused: true }, now), "Automatic sync paused");
 		assert.equal(backupHeadline({ ...base, paused: true, busy: "sync" }, now), "Running sync…");
+	});
+	test("asks for a restart after a clone, unless an operation is running", () => {
+		const restart = { ...base, paused: true, restartRequired: true };
+		assert.equal(backupHeadline(restart, now), "Restart LearnHarness to finish cloning");
+		assert.equal(backupHeadline({ ...restart, busy: "sync" }, now), "Running sync…");
+	});
+});
+
+describe("cloneDetails", () => {
+	test("names the backup folder when local files were moved", () => {
+		assert.equal(
+			cloneDetails(".learnharness-git-backup/2026-11-12_09-05-07"),
+			"LearnHarness loads the cloned learning data after a restart. Local files the backup replaced were moved to .learnharness-git-backup/2026-11-12_09-05-07.",
+		);
+	});
+	test("explains the restart alone when nothing was moved", () => {
+		assert.equal(cloneDetails(null), "LearnHarness loads the cloned learning data after a restart.");
 	});
 });
 
