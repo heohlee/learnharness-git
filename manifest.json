@@ -1,0 +1,12 @@
+{
+	"apiVersion": 1,
+	"id": "learnharness-git",
+	"name": "Git",
+	"version": "0.1.0",
+	"minAppVersion": "0.6.1",
+	"description": "Version your learning data with Git: automatic commit, pull and push, a Source Control view and commit history.",
+	"author": "Giuliano Testa",
+	"main": "main.js",
+	"backend": "backend.cjs",
+	"styles": "styles.css"
+}
