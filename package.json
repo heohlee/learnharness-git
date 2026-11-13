@@ -1,6 +1,6 @@
 {
 	"name": "learnharness-git",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "LearnHarness plugin that versions the learning data with Git.",
 	"private": true,
 	"type": "module",
