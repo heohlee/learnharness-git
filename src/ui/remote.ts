@@ -30,7 +30,7 @@ function confirmPush(ctx: PluginFrontendContext, preview: Preview): Promise<bool
 						el(
 							"p",
 							"",
-							`This commits any pending changes and pushes ${plural(preview.files, "file")} of your learning data to ${preview.url}. Anyone with access to that repository can read them.`,
+							`Commits pending changes and pushes ${plural(preview.files, "file")} to ${preview.url}. Anyone with access can read them.`,
 						),
 					);
 					if (preview.sensitive.length) {
@@ -38,7 +38,7 @@ function confirmPush(ctx: PluginFrontendContext, preview: Preview): Promise<bool
 							el(
 								"p",
 								"lhgit-warning",
-								"These files may contain private configuration such as model settings or keys, and they will be pushed. A .gitignore only stops future commits: a file that is already committed stays in the history and is pushed anyway. Check them first:",
+								"May contain private settings or keys. Already committed files are pushed anyway, even if now in .gitignore:",
 							),
 						);
 						const list = el("ul", "lhgit-sensitive");
@@ -72,8 +72,8 @@ export function remoteRow(
 		key: "remote",
 		label: "Remote URL",
 		description: ready
-			? "Git URL of an empty repository, for example git@github.com:you/learning-data.git. Saving it connects it as origin and pushes your learning data after you confirm. Use SSH or a credential helper; never put a password or token in the URL."
-			: "Initialize the repository from the Git view first.",
+			? "Empty repository, e.g. git@github.com:you/learning-data.git. Saving sets origin and pushes after you confirm. No tokens in the URL."
+			: "Initialize the repository in the Git view first.",
 		value: state?.remote ?? "",
 		disabled: !ready,
 		validate: (value) => (value.trim() ? undefined : "Enter a Git remote URL."),

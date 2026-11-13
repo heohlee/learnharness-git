@@ -68,7 +68,8 @@ function collisions(cwd: string, remote: readonly string[]): string[] {
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");
-const stamp = (d: Date) =>
+/** Local time as YYYY-MM-DD_HH-mm-ss, safe in folder names. */
+export const stamp = (d: Date) =>
 	`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
 
 /** Removes `dir` and its subfolders when they hold no files. */
@@ -80,7 +81,15 @@ function removeEmpty(dir: string): void {
 	if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
 }
 
-function excludeBackups(cwd: string): void {
+/** `base` (relative to `cwd`), or `base-2`, `base-3`… when it exists: never write onto an earlier backup. */
+export function freshBackupDir(cwd: string, base: string): string {
+	let dir = base;
+	for (let n = 2; fs.existsSync(path.join(cwd, dir)); n++) dir = `${base}-${n}`;
+	return dir;
+}
+
+/** Keeps backups out of commits through the repository's own exclude file, not a .gitignore. */
+export function excludeBackups(cwd: string): void {
 	const exclude = path.join(cwd, ".git", "info", "exclude");
 	fs.mkdirSync(path.dirname(exclude), { recursive: true });
 	const current = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
@@ -91,9 +100,7 @@ function excludeBackups(cwd: string): void {
 
 export async function cloneInPlace(git: CloneGit, cwd: string, url: string, now: Date): Promise<CloneResult> {
 	if (hasOwnData(cwd)) {
-		throw new Error(
-			"This folder already has your own sessions or knowledge graph. Cloning would mix two libraries; merge them by hand with git instead.",
-		);
+		throw new Error("This folder has sessions or a graph. Clone only into a new data folder.");
 	}
 	const gitDir = path.join(cwd, ".git");
 	const hadGitDir = fs.existsSync(gitDir);
@@ -107,9 +114,7 @@ export async function cloneInPlace(git: CloneGit, cwd: string, url: string, now:
 		const symref = (await git.exec(["ls-remote", "--symref", "origin", "HEAD"])).stdout;
 		const branch = /^ref: refs\/heads\/([^\s-]\S*)\tHEAD$/m.exec(symref)?.[1] ?? "main";
 		if ((await git.run(["rev-parse", "-q", "--verify", `refs/remotes/origin/${branch}`])).code !== 0) {
-			throw new Error(
-				"The remote repository is empty. Use “Initialize repository” and connect it from Settings instead.",
-			);
+			throw new Error("Remote is empty. Use Initialize, then connect it in Settings.");
 		}
 		const listing = await git.exec([
 			"-c",
@@ -123,9 +128,7 @@ export async function cloneInPlace(git: CloneGit, cwd: string, url: string, now:
 		const colliding = collisions(cwd, listing.stdout.split("\0").filter(Boolean));
 
 		if (colliding.length) {
-			backupDir = `${BACKUP_ROOT}/${stamp(now)}`;
-			// Never move a file onto an earlier backup.
-			for (let n = 2; fs.existsSync(path.join(cwd, backupDir)); n++) backupDir = `${BACKUP_ROOT}/${stamp(now)}-${n}`;
+			backupDir = freshBackupDir(cwd, `${BACKUP_ROOT}/${stamp(now)}`);
 			for (const rel of colliding) {
 				const from = path.join(cwd, rel);
 				const to = path.join(cwd, backupDir, rel);

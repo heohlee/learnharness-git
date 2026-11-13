@@ -2,6 +2,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { type CloneResult, cloneInPlace } from "./clone.ts";
+import { type ConflictPolicy, createResolver, parseUnmerged, type Resolution } from "./conflicts.ts";
+import { conflictMessage } from "./format.ts";
+
+export type { Resolution, ResolvedFile, Side } from "./conflicts.ts";
 
 export interface GitResult {
 	code: number;
@@ -24,22 +28,69 @@ export class GitError extends Error {
 	}
 }
 
+/** A pull stopped on conflicts nothing could decide; the merge was aborted. */
 export class ConflictError extends Error {
-	constructor() {
-		super(
-			"Pull stopped by a merge conflict. The merge was aborted and your files are unchanged; resolve it manually with git.",
-		);
+	readonly upstream: string;
+	/** Conflicted paths to show: the ones the user already chose plus those still needing a choice. */
+	readonly files: readonly string[];
+	/** One line per file whose chosen side was rejected (not valid JSON), in conflict order. */
+	readonly notes: readonly string[];
+	constructor(upstream: string, files: readonly string[], notes: readonly string[] = []) {
+		super(conflictMessage(upstream));
 		this.name = "ConflictError";
+		this.upstream = upstream;
+		this.files = files;
+		this.notes = notes;
 	}
 }
 
 export class MergeInProgressError extends Error {
 	constructor() {
-		super(
-			"A merge or unresolved conflict is in progress in the learning data folder. Finish or abort it with git; the plugin will not commit or pull until then.",
-		);
+		super("Unfinished merge. Finish or abort it to resume sync.");
 		this.name = "MergeInProgressError";
 	}
+}
+
+/** git could not authenticate to the remote; the message names the fixes. */
+export class AuthError extends Error {
+	/** git's own message. */
+	readonly detail: string;
+	constructor(url: string | null, detail: string) {
+		const ssh = url === null ? null : sshUrl(url);
+		super(
+			ssh === null
+				? "Git authentication failed. No credentials for the remote. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL."
+				: `Git authentication failed. No credentials for ${ssh.host}. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL (git@${ssh.host}:${ssh.path}).`,
+		);
+		this.name = "AuthError";
+		this.detail = detail;
+	}
+}
+
+const AUTH_FAILURE =
+	/could not read Username|terminal prompts disabled|Authentication failed|Permission denied \(publickey\)|invalid username or password/i;
+
+/** Host and repository path of a remote URL (https, ssh:// or scp-like), or null for a local path. */
+function sshUrl(url: string): { host: string; path: string } | null {
+	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+		try {
+			const parsed = new URL(url);
+			const repo = parsed.pathname.replace(/^\/+|\/+$/g, "");
+			return parsed.hostname && repo ? { host: parsed.hostname, path: repo } : null;
+		} catch {
+			return null;
+		}
+	}
+	const scp = /^(?:[^@/:]+@)?([^/:]+):(.+)$/.exec(url);
+	return scp ? { host: scp[1] as string, path: (scp[2] as string).replace(/^\/+/, "") } : null;
+}
+
+/** How `pull` handles a merge that stops on conflicts. */
+export interface PullPolicy extends ConflictPolicy {
+	/** Names the backup folder; defaults to the current time. */
+	now?: Date;
+	/** Called with the report after the conflicts were resolved and committed. */
+	onResolved?: (resolution: Resolution) => void;
 }
 
 export interface FileChange {
@@ -152,11 +203,16 @@ export function parseLog(stdout: string): Commit[] {
 }
 
 export function createGit(run: GitRunner, cwd: string) {
+	async function fail(args: readonly string[], result: GitResult): Promise<never> {
+		if (AUTH_FAILURE.test(result.stderr)) throw new AuthError(await remoteUrl(), result.stderr.trim());
+		throw new GitError(args, result);
+	}
 	async function exec(args: string[], okCodes: readonly number[] = [0]): Promise<GitResult> {
 		const result = await run(args, { cwd });
-		if (!okCodes.includes(result.code)) throw new GitError(args, result);
+		if (!okCodes.includes(result.code)) await fail(args, result);
 		return result;
 	}
+	const resolver = createResolver(exec, cwd);
 	async function revision(name: string): Promise<string | null> {
 		const result = await run(["rev-parse", "-q", "--verify", name], { cwd });
 		return result.code === 0 ? result.stdout.trim() : null;
@@ -222,21 +278,45 @@ export function createGit(run: GitRunner, cwd: string) {
 			await exec(["commit", "-q", "-m", message]);
 			return { committed: true };
 		},
-		async pull(): Promise<"no-upstream" | "up-to-date" | "pulled"> {
-			if (!(await status()).upstream) return "no-upstream";
-			// Only a merge started by this pull may be aborted below.
+		/**
+		 * Merges the upstream. On conflicts every file gets a side from `policy` and the merge is committed;
+		 * when any file cannot be decided the merge is aborted (files unchanged) and ConflictError lists them.
+		 */
+		async pull(policy: PullPolicy = { mode: "manual" }): Promise<"no-upstream" | "up-to-date" | "pulled"> {
+			const { upstream } = await status();
+			if (!upstream) return "no-upstream";
+			// Only a merge started by this pull may be resolved or aborted below.
 			await refuseDuringMerge();
 			const before = await revision("HEAD");
 			const args = ["pull", "--no-rebase", "--no-edit"];
 			const result = await run(args, { cwd });
-			if (result.code !== 0) {
-				if ((await revision("MERGE_HEAD")) !== null) {
-					await exec(["merge", "--abort"]);
-					throw new ConflictError();
-				}
-				throw new GitError(args, result);
+			if (result.code === 0) return (await revision("HEAD")) === before ? "up-to-date" : "pulled";
+			if ((await revision("MERGE_HEAD")) === null) return fail(args, result);
+			const conflicts = parseUnmerged((await exec(["ls-files", "-u", "-z"])).stdout);
+			const { decisions, undecided, notes } = await resolver.plan(conflicts, policy);
+			if (undecided.length || decisions.length === 0) {
+				// Never leave conflict markers inside JSON learning records.
+				await exec(["merge", "--abort"]);
+				// Files the user already chose stay listed, so the screen keeps those choices and a conflict
+				// that appears between two attempts adds to the list instead of replacing it.
+				// A rejected choice is undecided, so its file stays listed next to its note.
+				const chosen = new Set(decisions.filter((d) => d.rule === "your choice").map((d) => d.path));
+				const listed = [...conflicts.keys()].filter((file) => chosen.has(file) || undecided.includes(file));
+				throw new ConflictError(upstream, listed, notes);
 			}
-			return (await revision("HEAD")) === before ? "up-to-date" : "pulled";
+			let resolution: Resolution;
+			try {
+				resolution = await resolver.apply(decisions, policy.now ?? new Date());
+			} catch (error) {
+				await run(["merge", "--abort"], { cwd });
+				throw error;
+			}
+			policy.onResolved?.(resolution);
+			return "pulled";
+		},
+		/** Read-only diff of one file between HEAD and the fetched upstream. */
+		async conflictDiff(file: string): Promise<string> {
+			return (await exec([LITERAL, "diff", "--no-color", "HEAD", "@{upstream}", "--", file])).stdout;
 		},
 		async push(): Promise<"no-upstream" | "up-to-date" | "pushed"> {
 			const current = await status();
@@ -288,11 +368,22 @@ export function createGit(run: GitRunner, cwd: string) {
 			const name = result.stdout.trim();
 			return result.code === 0 && name ? name : null;
 		},
+		/** Recent commits; a merge lists the files it changed relative to its first parent. */
 		async log(limit: number): Promise<Commit[]> {
 			if ((await revision("HEAD")) === null) return [];
 			const format = "--format=%x1e%H%x1f%h%x1f%an%x1f%aI%x1f%s";
 			return parseLog(
-				(await exec(["-c", "core.quotePath=false", "log", `-n${limit}`, format, "--name-status"])).stdout,
+				(
+					await exec([
+						"-c",
+						"core.quotePath=false",
+						"log",
+						`-n${limit}`,
+						format,
+						"--name-status",
+						"--diff-merges=first-parent",
+					])
+				).stdout,
 			);
 		},
 	};

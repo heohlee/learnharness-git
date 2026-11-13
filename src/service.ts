@@ -1,7 +1,7 @@
 /** Plugin backend logic: serialized git operations, automatic sync and JSON handlers. */
 
 import { sensitiveFiles } from "./format.ts";
-import { ConflictError, type Git, type RepoState } from "./git.ts";
+import { ConflictError, type Git, type RepoState, type Resolution, type Side } from "./git.ts";
 import { DEFAULT_SETTINGS, formatCommitMessage, mergeSettings, type Settings, type SettingsStore } from "./settings.ts";
 
 export interface Clock {
@@ -26,12 +26,21 @@ export interface State {
 	restartRequired: boolean;
 	/** Where the last clone moved colliding local files, or null. */
 	cloneBackupDir: string | null;
+	/** Branch the last clone checked out, or null. */
+	cloneBranch: string | null;
+	/**
+	 * Conflicted files waiting for the user's choice after an aborted pull, or null. `notes` has one line per file
+	 * whose chosen side was rejected because it is not valid JSON.
+	 */
+	pendingConflicts: { upstream: string; files: { path: string }[]; notes: string[] } | null;
+	/** Report of the last automatic or chosen conflict resolution, until dismissed. */
+	lastResolution: Resolution | null;
 	settings: Settings;
 }
 
 export type Handler = (input: unknown) => Promise<unknown>;
 
-const NOT_A_REPO = "The learning data folder is not a Git repository yet. Run “Initialize repository” first.";
+const NOT_A_REPO = "No Git repository yet.";
 
 function record(input: unknown): Record<string, unknown> {
 	return typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
@@ -60,6 +69,19 @@ function remoteUrl(input: unknown): string {
 	return url;
 }
 
+/** `{ choices: { "<path>": "local" | "remote" } }` from the conflict screen. */
+function choices(input: unknown): Record<string, Side> {
+	const value = record(input).choices;
+	const valid =
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Object.keys(value).length > 0 &&
+		Object.entries(value).every(([file, side]) => file.length > 0 && (side === "local" || side === "remote"));
+	if (!valid) throw new Error("choices must map each file to local or remote.");
+	return { ...(value as Record<string, Side>) };
+}
+
 function filePath(input: unknown): string {
 	const value = record(input).path;
 	if (typeof value !== "string" || value.length === 0) throw new Error("path must be a non-empty string.");
@@ -83,6 +105,9 @@ export function createService(deps: {
 		remote: null,
 		restartRequired: false,
 		cloneBackupDir: null,
+		cloneBranch: null,
+		pendingConflicts: null,
+		lastResolution: null,
 		settings: { ...DEFAULT_SETTINGS },
 	};
 	let loaded: Promise<void> | null = null;
@@ -111,7 +136,14 @@ export function createService(deps: {
 				return result;
 			} catch (error) {
 				state.lastError = error instanceof Error ? error.message : String(error);
-				if (error instanceof ConflictError) state.paused = true;
+				if (error instanceof ConflictError) {
+					state.paused = true;
+					state.pendingConflicts = {
+						upstream: error.upstream,
+						files: error.files.map((file) => ({ path: file })),
+						notes: [...error.notes],
+					};
+				}
 				throw error;
 			} finally {
 				state.busy = null;
@@ -131,13 +163,30 @@ export function createService(deps: {
 	/** init and clone create a repository; one that already exists stays untouched. */
 	async function refuseRepo(): Promise<void> {
 		state.repo = await git.repoState();
-		if (state.repo.kind === "repo") throw new Error("The learning data folder is already a Git repository.");
+		if (state.repo.kind === "repo") throw new Error("Already a Git repository.");
 	}
 
-	async function pull() {
-		const result = await git.pull();
+	async function pull(chosen: Record<string, Side> = {}) {
+		const result = await git.pull({
+			mode: state.settings.conflictMode,
+			now: clock.now(),
+			choices: chosen,
+			onResolved: (resolution) => {
+				state.lastResolution = resolution;
+			},
+		});
 		state.paused = false;
+		state.pendingConflicts = null;
 		return result;
+	}
+
+	/** Commit, pull (with the user's conflict choices) and push. */
+	async function sync(chosen: Record<string, Side> = {}) {
+		const { committed } = await git.commit(message(), { all: true });
+		const pullResult = await pull(chosen);
+		const pushResult = await git.push();
+		state.lastSync = clock.now().toISOString();
+		return { committed, pull: pullResult, push: pushResult };
 	}
 
 	const message = () => formatCommitMessage(state.settings.commitMessage, clock.now());
@@ -221,6 +270,7 @@ export function createService(deps: {
 				state.remote = url;
 				state.restartRequired = true;
 				state.cloneBackupDir = result.backupDir;
+				state.cloneBranch = result.branch;
 				return result;
 			});
 		},
@@ -242,13 +292,20 @@ export function createService(deps: {
 		}),
 		pull: inRepo("pull", () => pull()),
 		push: inRepo("push", () => git.push()),
-		sync: inRepo("sync", async () => {
-			const { committed } = await git.commit(message(), { all: true });
-			const pullResult = await pull();
-			const pushResult = await git.push();
-			state.lastSync = clock.now().toISOString();
-			return { committed, pull: pullResult, push: pushResult };
-		}),
+		sync: inRepo("sync", () => sync()),
+		conflictDiff: inRepo("conflict diff", (input) => git.conflictDiff(filePath(input)), read),
+		resolveConflicts: async (input) => {
+			const chosen = choices(input);
+			return exclusive("resolve conflicts", async () => {
+				await requireRepo();
+				return sync(chosen);
+			});
+		},
+		dismissResolution: () =>
+			exclusive("dismiss", async () => {
+				state.lastResolution = null;
+				return snapshot();
+			}),
 		previewRemote: async (input) => {
 			const url = remoteUrl(input);
 			return exclusive(

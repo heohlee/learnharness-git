@@ -48,6 +48,13 @@
 	flex-wrap: wrap;
 	gap: 0.5rem;
 }
+.lhgit-slot[hidden] {
+	display: none;
+}
+.lhgit-card.lhgit-alert {
+	border-color: color-mix(in srgb, var(--destructive) 45%, var(--border));
+	background: color-mix(in srgb, var(--destructive) 6%, transparent);
+}
 /* "Backed up …" opens Git History: subtle underlined text, not a button. */
 .lhgit-headline-link {
 	all: unset;
@@ -64,10 +71,92 @@
 	outline-offset: 2px;
 	border-radius: 2px;
 }
-.lhgit-primary[data-mode="sync"] > :nth-child(2),
-.lhgit-primary[data-mode="sync"] > :nth-child(3),
-.lhgit-primary[data-mode="init"] > :nth-child(1) {
+.lhgit-alert .lhgit-headline {
+	color: var(--destructive);
+}
+
+/* Notice after an automatic conflict resolution (artboard 04). */
+.lhgit-notice-block[hidden],
+.lhgit-conflicts[hidden] {
 	display: none;
+}
+.lhgit-notice {
+	display: flex;
+	gap: 0.75rem;
+	align-items: center;
+	padding: 0.625rem 0.75rem;
+	border: 1px solid var(--border);
+	border-left: 3px solid var(--chart-4, #a16207);
+	border-radius: 0.375rem;
+}
+.lhgit-notice-text {
+	flex: 1;
+	min-width: 0;
+}
+.lhgit-resolution {
+	margin-top: 0.5rem;
+}
+.lhgit-resolution > summary {
+	cursor: pointer;
+}
+.lhgit-resolution > summary:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+.lhgit-path {
+	color: var(--foreground);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* Diff dialog: the host shows no title, so the file path heads the content. */
+.lhgit-dialog-title {
+	margin: 0 0 0.25rem;
+	font-size: 0.9375rem;
+	font-weight: 600;
+}
+.lhgit-legend {
+	margin-bottom: 0.5rem;
+	font-family: var(--font-mono, monospace);
+}
+
+/* Conflict screen (artboard 05). */
+.lhgit-conflicts {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+.lhgit-segment {
+	display: inline-flex;
+	gap: 0.25rem;
+}
+
+/* Authentication failure with its fixes (artboard 03). */
+.lhgit-auth {
+	color: var(--foreground);
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+	white-space: normal;
+}
+.lhgit-auth-title {
+	color: var(--destructive);
+}
+.lhgit-steps {
+	margin: 0.25rem 0 0;
+	padding-left: 1.25rem;
+	line-height: 1.7;
+}
+.lhgit-cmd {
+	display: block;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: 0.75rem;
+	background: var(--muted);
+	border-radius: 0.375rem;
+	padding: 0.375rem 0.625rem;
+	overflow-wrap: anywhere;
+	user-select: all;
 }
 
 /* Secondary sections. */

@@ -1,17 +1,27 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+	authHint,
 	backupDetails,
 	backupHeadline,
+	CONFLICT_DIFF_LEGEND,
 	changeLabel,
 	cloneDetails,
 	commitCells,
+	conflictHeadline,
+	conflictMessage,
 	describeBranch,
 	diffMarkdown,
+	filesLeft,
+	invalidJsonNote,
+	isConflictMessage,
+	keptLabel,
 	plural,
 	relativeTime,
+	resolvedNotice,
 	sensitiveFiles,
 	shortTime,
+	visibleError,
 } from "../src/format.ts";
 import type { Status } from "../src/git.ts";
 
@@ -133,12 +143,20 @@ describe("backupHeadline", () => {
 	test("names the states that override it, in priority order", () => {
 		assert.equal(backupHeadline({ ...base, repo: false }, now), "Not backed up yet");
 		assert.equal(backupHeadline({ ...base, lastCommit: null }, now), "Not backed up yet");
-		assert.equal(backupHeadline({ ...base, paused: true }, now), "Automatic sync paused");
+		assert.equal(backupHeadline({ ...base, paused: true }, now), "Sync paused: merge conflict");
 		assert.equal(backupHeadline({ ...base, paused: true, busy: "sync" }, now), "Running sync…");
 	});
+	test("counts the pending conflicted files while paused, singular for one", () => {
+		assert.deepEqual(
+			[1, 2].map((conflicts) => backupHeadline({ ...base, paused: true, conflicts }, now)),
+			["Sync paused: merge conflict in 1 file", "Sync paused: merge conflict in 2 files"],
+		);
+		assert.equal(backupHeadline({ ...base, paused: true, conflicts: 0 }, now), "Sync paused: merge conflict");
+	});
 	test("asks for a restart after a clone, unless an operation is running", () => {
-		const restart = { ...base, paused: true, restartRequired: true };
-		assert.equal(backupHeadline(restart, now), "Restart LearnHarness to finish cloning");
+		const restart = { ...base, paused: true, restartRequired: true, cloneBranch: "trunk" };
+		assert.equal(backupHeadline(restart, now), "Cloned origin/trunk. Restart LearnHarness.");
+		assert.equal(backupHeadline({ ...restart, cloneBranch: null }, now), "Cloned origin/main. Restart LearnHarness.");
 		assert.equal(backupHeadline({ ...restart, busy: "sync" }, now), "Running sync…");
 	});
 });
@@ -147,11 +165,11 @@ describe("cloneDetails", () => {
 	test("names the backup folder when local files were moved", () => {
 		assert.equal(
 			cloneDetails(".learnharness-git-backup/2026-11-12_09-05-07"),
-			"LearnHarness loads the cloned learning data after a restart. Local files the backup replaced were moved to .learnharness-git-backup/2026-11-12_09-05-07.",
+			"Replaced local files moved to .learnharness-git-backup/2026-11-12_09-05-07.",
 		);
 	});
-	test("explains the restart alone when nothing was moved", () => {
-		assert.equal(cloneDetails(null), "LearnHarness loads the cloned learning data after a restart.");
+	test("is empty when nothing was moved", () => {
+		assert.equal(cloneDetails(null), "");
 	});
 });
 
@@ -166,20 +184,107 @@ describe("backupDetails", () => {
 				},
 				now,
 			),
-			["6 changes since then", "next automatic sync in 6 min", "main → origin/main · up to date"],
+			["6 changes", "next sync in 6 min", "main → origin/main · up to date"],
 		);
 	});
 	test("says when nothing changed and automation is off", () => {
-		assert.deepEqual(backupDetails({ changes: 0, nextSync: null, status: null }, now), [
-			"No changes since then",
-			"automatic sync off",
-		]);
+		assert.deepEqual(backupDetails({ changes: 0, nextSync: null, status: null }, now), ["No changes", "auto sync off"]);
 	});
 	test("never promises a sync in less than 1 minute", () => {
-		assert.equal(
-			backupDetails({ changes: 1, nextSync: ago(1000), status: null }, now)[1],
-			"next automatic sync in 1 min",
+		assert.equal(backupDetails({ changes: 1, nextSync: ago(1000), status: null }, now)[1], "next sync in 1 min");
+	});
+});
+
+describe("conflict texts", () => {
+	test("conflictHeadline counts files, singular for one", () => {
+		assert.deepEqual(
+			[conflictHeadline(1), conflictHeadline(3)],
+			["Merge conflict in 1 file", "Merge conflict in 3 files"],
 		);
+	});
+	test("filesLeft names how many files still need a version", () => {
+		assert.deepEqual([filesLeft(1), filesLeft(2)], ["1 file left.", "2 files left."]);
+	});
+	test("resolvedNotice says the newest version was kept when every file followed a rule", () => {
+		const auto = (file: string) => ({ path: file, kept: "local" as const, rule: "newer commit" });
+		assert.deepEqual(
+			[
+				resolvedNotice([auto("a.json")]),
+				resolvedNotice([auto("a.json"), { ...auto("b.jsonl"), kept: "both", rule: "union merge" }]),
+			],
+			["Merge conflict in 1 file resolved: newest kept.", "Merge conflict in 2 files resolved: newest kept."],
+		);
+	});
+	test("resolvedNotice drops 'newest kept' when any file was the user's choice", () => {
+		const chosen = (file: string) => ({ path: file, kept: "remote" as const, rule: "your choice" });
+		assert.deepEqual(
+			[
+				resolvedNotice([chosen("a.json")]),
+				resolvedNotice([chosen("a.json"), { path: "b.json", kept: "local", rule: "newer commit" }]),
+			],
+			["Merge conflict in 1 file resolved.", "Merge conflict in 2 files resolved."],
+		);
+	});
+	test("conflictMessage names the upstream and isConflictMessage recognizes only it", () => {
+		const message = conflictMessage("origin/main");
+		assert.equal(message, "Merge conflict with origin/main. Pull aborted; no files changed.");
+		assert.deepEqual(
+			[message, conflictMessage("upstream/trunk"), "git pull failed: boom", `${message} extra`, ""].map(
+				isConflictMessage,
+			),
+			[true, true, false, false, false],
+		);
+	});
+	test("invalidJsonNote names the rejected side, the side to pick, or a fix with git; it is not the conflict message", () => {
+		const notes = [
+			invalidJsonNote("settings.json", "local", true),
+			invalidJsonNote("chats/a.json", "remote", true),
+			invalidJsonNote("settings.json", "local", false),
+		];
+		assert.deepEqual(notes, [
+			"settings.json: the Local version is not valid JSON. Pick Remote.",
+			"chats/a.json: the Remote version is not valid JSON. Pick Local.",
+			"settings.json: both versions are not valid JSON. Fix it by hand with git.",
+		]);
+		assert.deepEqual(notes.map(isConflictMessage), [false, false, false]);
+	});
+	test("the conflict diff legend names each side", () => {
+		assert.equal(CONFLICT_DIFF_LEGEND, "− Local · + Remote");
+	});
+	test("keptLabel names the kept side", () => {
+		assert.deepEqual([keptLabel("local"), keptLabel("remote"), keptLabel("both")], ["Local", "Remote", "Both"]);
+	});
+});
+
+describe("authHint", () => {
+	test("splits the authentication message into its fixes", () => {
+		assert.deepEqual(
+			authHint(
+				"Git authentication failed. No credentials for github.com. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL (git@github.com:me/data.git).",
+			),
+			{
+				headline: "Git authentication failed",
+				sub: "No credentials for github.com. Set up one, then retry:",
+				gh: "gh auth login && gh auth setup-git",
+				ssh: "git@github.com:me/data.git",
+			},
+		);
+	});
+	test("has no SSH URL when the host is unknown", () => {
+		assert.deepEqual(
+			authHint(
+				"Git authentication failed. No credentials for the remote. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL.",
+			),
+			{
+				headline: "Git authentication failed",
+				sub: "No credentials for the remote. Set up one, then retry:",
+				gh: "gh auth login && gh auth setup-git",
+				ssh: null,
+			},
+		);
+	});
+	test("is null for other errors", () => {
+		assert.equal(authHint("git push failed: rejected"), null);
 	});
 });
 
@@ -195,4 +300,56 @@ test("sensitiveFiles flags the app's root settings and token or API key files", 
 		]),
 		["settings.json", "notes/auth-token.json", "MyApiKey.txt"],
 	);
+});
+
+describe("visibleError", () => {
+	const auth =
+		"Git authentication failed. No credentials for 127.0.0.1. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL (git@127.0.0.1:lab.git).";
+	const idle = { localError: null, lastError: null, busy: null, paused: false };
+	test("a stale backend error is gone while git runs and after the action succeeds", () => {
+		const unfinished = "Unfinished merge in the repository. Finish or abort it with git, then retry.";
+		assert.deepEqual(
+			[
+				visibleError({ ...idle, lastError: unfinished }),
+				visibleError({ ...idle, lastError: unfinished, busy: "sync" }),
+				visibleError(idle),
+			],
+			[unfinished, null, null],
+		);
+	});
+	test("the user's failed action in this view is shown, even while paused or while git runs", () => {
+		assert.deepEqual(
+			[
+				visibleError({ ...idle, localError: "Nothing to commit." }),
+				visibleError({ ...idle, localError: "boom", lastError: "older", busy: "auto sync" }),
+				visibleError({
+					...idle,
+					localError: "settings.json: the Local version is not valid JSON. Pick Remote.",
+					paused: true,
+				}),
+			],
+			["Nothing to commit.", "boom", "settings.json: the Local version is not valid JSON. Pick Remote."],
+		);
+	});
+	test("the aborted pull's conflict message is hidden; a paused backend error is left to the headline", () => {
+		const conflict = conflictMessage("origin/main");
+		assert.deepEqual(
+			[
+				visibleError({ ...idle, lastError: conflict }),
+				visibleError({ ...idle, localError: conflict }),
+				visibleError({ ...idle, lastError: "git pull failed: boom", paused: true }),
+			],
+			[null, null, null],
+		);
+	});
+	test("an authentication error stays until a later success", () => {
+		assert.deepEqual(
+			[
+				visibleError({ ...idle, lastError: auth }),
+				visibleError({ ...idle, lastError: auth, busy: "clone" }),
+				visibleError({ ...idle, lastError: null }),
+			],
+			[auth, null, null],
+		);
+	});
 });

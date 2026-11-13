@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { ConflictError, type Git, MergeInProgressError, type RepoState } from "../src/git.ts";
+import {
+	ConflictError,
+	type Git,
+	MergeInProgressError,
+	type PullPolicy,
+	type RepoState,
+	type Resolution,
+} from "../src/git.ts";
 import { type Clock, createService } from "../src/service.ts";
 import { DEFAULT_SETTINGS, type Settings } from "../src/settings.ts";
 
 function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: Partial<Git> } = {}) {
 	const calls: string[] = [];
+	const policies: PullPolicy[] = [];
 	const events: { topic: string; data: unknown }[] = [];
 	const timers: { fn: () => void; ms: number; cleared: boolean }[] = [];
 	let saved: Settings | null = null;
@@ -34,7 +42,12 @@ function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: 
 		unstage: record("unstage", undefined),
 		diff: record("diff", "DIFF"),
 		commit: record("commit", { committed: true }),
-		pull: record("pull", "pulled"),
+		pull: async (policy: PullPolicy) => {
+			calls.push("pull");
+			policies.push(policy);
+			return "pulled";
+		},
+		conflictDiff: record("conflictDiff", "CONFLICT DIFF"),
 		push: record("push", "pushed"),
 		log: record("log", []),
 		userName: record("userName", "Ada"),
@@ -60,8 +73,15 @@ function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: 
 		},
 		emit: (topic, data) => events.push({ topic, data }),
 	});
-	return { service, calls, events, timers, saved: () => saved };
+	return { service, calls, policies, events, timers, saved: () => saved };
 }
+
+type Pending = {
+	paused: boolean;
+	lastError: string | null;
+	pendingConflicts: { upstream: string; files: { path: string }[]; notes: string[] } | null;
+	lastResolution: Resolution | null;
+};
 
 const call = (s: ReturnType<typeof setup>, name: string, input?: unknown) => {
 	const handler = s.service.handlers[name];
@@ -141,21 +161,27 @@ describe("auto sync tick", () => {
 			settings: { autoPush: true },
 			git: {
 				pull: async () => {
-					if (conflict) throw new ConflictError();
+					if (conflict) throw new ConflictError("origin/main", ["notes.md", "chats/a.json"]);
 					return "pulled";
 				},
 			},
 		});
 		await s.service.tick();
-		const paused = (await call(s, "state")) as { paused: boolean; lastError: string };
+		const paused = (await call(s, "state")) as Pending;
 		assert.equal(paused.paused, true);
-		assert.equal(paused.lastError, new ConflictError().message);
+		assert.equal(paused.lastError, "Merge conflict with origin/main. Pull aborted; no files changed.");
+		assert.deepEqual(paused.pendingConflicts, {
+			upstream: "origin/main",
+			files: [{ path: "notes.md" }, { path: "chats/a.json" }],
+			notes: [],
+		});
 		s.calls.length = 0;
 		await s.service.tick();
 		assert.deepEqual(s.calls, []);
 		conflict = false;
 		await call(s, "pull");
-		assert.equal(((await call(s, "state")) as { paused: boolean; lastError: null }).paused, false);
+		const resumed = (await call(s, "state")) as Pending;
+		assert.deepEqual([resumed.paused, resumed.pendingConflicts], [false, null]);
 	});
 	test("records other errors without pausing", async () => {
 		const s = setup({ git: { commit: async () => Promise.reject(new Error("boom")) } });
@@ -196,7 +222,7 @@ describe("handlers", () => {
 	test("refuse to run outside a repository", async () => {
 		const s = setup({ repo: { kind: "none" } });
 		await assert.rejects(call(s, "status"), {
-			message: "The learning data folder is not a Git repository yet. Run “Initialize repository” first.",
+			message: "No Git repository yet.",
 		});
 		assert.deepEqual(s.calls, ["repoState"]);
 	});
@@ -205,7 +231,7 @@ describe("handlers", () => {
 		await call(s, "init");
 		assert.deepEqual(s.calls, ["repoState", "init"]);
 		const t = setup();
-		await assert.rejects(call(t, "init"), { message: "The learning data folder is already a Git repository." });
+		await assert.rejects(call(t, "init"), { message: "Already a Git repository." });
 		assert.deepEqual(t.calls, ["repoState"]);
 	});
 	test("commit uses the given message or the template", async () => {
@@ -408,11 +434,18 @@ describe("remote", () => {
 
 describe("clone", () => {
 	const URL = "git@github.com:me/learning-data.git";
-	type CloneState = { repo: RepoState; remote: string | null; restartRequired: boolean; cloneBackupDir: string | null };
+	type CloneState = {
+		repo: RepoState;
+		remote: string | null;
+		restartRequired: boolean;
+		cloneBackupDir: string | null;
+		cloneBranch: string | null;
+	};
 	test("state starts without a pending restart", async () => {
 		const state = (await call(setup(), "state")) as CloneState;
 		assert.equal(state.restartRequired, false);
 		assert.equal(state.cloneBackupDir, null);
+		assert.equal(state.cloneBranch, null);
 	});
 	test("clones into a folder that is not a repository and asks for a restart", async () => {
 		const s = setup({ repo: { kind: "none" } });
@@ -431,8 +464,20 @@ describe("clone", () => {
 			],
 		);
 		assert.deepEqual(
-			{ repo: last.repo, remote: last.remote, restartRequired: last.restartRequired, backup: last.cloneBackupDir },
-			{ repo: { kind: "repo" }, remote: URL, restartRequired: true, backup: ".learnharness-git-backup/x" },
+			{
+				repo: last.repo,
+				remote: last.remote,
+				restartRequired: last.restartRequired,
+				backup: last.cloneBackupDir,
+				branch: last.cloneBranch,
+			},
+			{
+				repo: { kind: "repo" },
+				remote: URL,
+				restartRequired: true,
+				backup: ".learnharness-git-backup/x",
+				branch: "main",
+			},
 		);
 	});
 	test("clones into a folder nested inside another repository", async () => {
@@ -443,7 +488,7 @@ describe("clone", () => {
 	test("refuses a folder that already is a repository before cloning", async () => {
 		const s = setup();
 		await assert.rejects(call(s, "clone", { url: URL }), {
-			message: "The learning data folder is already a Git repository.",
+			message: "Already a Git repository.",
 		});
 		assert.deepEqual(s.calls, ["repoState"]);
 		const state = (await call(s, "state")) as CloneState;
@@ -460,5 +505,156 @@ describe("clone", () => {
 			{ restartRequired: last.restartRequired, lastError: last.lastError, repo: last.repo, remote: last.remote },
 			{ restartRequired: false, lastError: "git fetch failed: denied", repo: { kind: "none" }, remote: null },
 		);
+	});
+});
+
+describe("conflicts", () => {
+	const REPORT: Resolution = {
+		backupDir: ".learnharness-git-backup/conflicts/2026-11-12_09-30-00",
+		files: [{ path: "chats/a.json", kept: "remote", rule: "newer session" }],
+	};
+	const policyOf = (policy: PullPolicy | undefined) => ({
+		mode: policy?.mode,
+		now: policy?.now,
+		choices: policy?.choices,
+		callback: typeof policy?.onResolved,
+	});
+	test("state starts without pending conflicts or a resolution", async () => {
+		const state = (await call(setup(), "state")) as Pending;
+		assert.deepEqual([state.pendingConflicts, state.lastResolution], [null, null]);
+	});
+	test("pull, sync, start and tick pull with the conflict setting, the clock and no choices", async () => {
+		const s = setup({ settings: { conflictMode: "manual", pullOnStart: true, autoPush: true } });
+		await s.service.start();
+		await call(s, "pull");
+		await call(s, "sync");
+		await s.service.tick();
+		assert.equal(s.policies.length, 4);
+		for (const policy of s.policies) {
+			assert.deepEqual(policyOf(policy), {
+				mode: "manual",
+				now: new Date(2026, 10, 12, 9, 30),
+				choices: {},
+				callback: "function",
+			});
+		}
+	});
+	test("an automatic resolution is kept in state until dismissed", async () => {
+		const s = setup({
+			git: {
+				pull: async (policy?: PullPolicy) => {
+					policy?.onResolved?.(REPORT);
+					return "pulled";
+				},
+			},
+		});
+		await call(s, "pull");
+		assert.deepEqual(((await call(s, "state")) as Pending).lastResolution, REPORT);
+		const dismissed = (await call(s, "dismissResolution")) as Pending;
+		assert.equal(dismissed.lastResolution, null);
+		const last = s.events.at(-1);
+		assert.ok(last);
+		assert.equal((last.data as Pending).lastResolution, null);
+		assert.equal(((await call(s, "state")) as Pending).lastResolution, null);
+	});
+	test("conflictDiff shows one file against the upstream without emitting state", async () => {
+		const s = setup();
+		assert.equal(await call(s, "conflictDiff", { path: "chats/a.json" }), "CONFLICT DIFF");
+		await assert.rejects(call(s, "conflictDiff", { path: "" }), { message: "path must be a non-empty string." });
+		assert.deepEqual(s.calls, ["repoState", `conflictDiff ${JSON.stringify(["chats/a.json"])}`, "repoState"]);
+		assert.deepEqual(s.events, []);
+	});
+	const invalidChoices: unknown[] = [
+		undefined,
+		{},
+		{ choices: [] },
+		{ choices: { "a.json": "mine" } },
+		{ choices: { "": "local" } },
+	];
+	for (const input of invalidChoices) {
+		test(`resolveConflicts rejects ${JSON.stringify(input)} without running git`, async () => {
+			const s = setup();
+			await assert.rejects(call(s, "resolveConflicts", input), {
+				message: "choices must map each file to local or remote.",
+			});
+			assert.deepEqual(s.calls, []);
+		});
+	}
+	test("resolveConflicts commits, pulls with the choices, pushes and resumes sync", async () => {
+		let conflict = true;
+		const choices = { "notes.md": "local", "chats/a.json": "remote" };
+		const seen: PullPolicy[] = [];
+		const s = setup({
+			git: {
+				pull: async (policy?: PullPolicy) => {
+					if (policy) seen.push(policy);
+					if (conflict) throw new ConflictError("origin/main", ["notes.md", "chats/a.json"]);
+					policy?.onResolved?.(REPORT);
+					return "pulled";
+				},
+			},
+		});
+		await assert.rejects(call(s, "sync"), ConflictError);
+		conflict = false;
+		s.calls.length = 0;
+		assert.deepEqual(await call(s, "resolveConflicts", { choices }), {
+			committed: true,
+			pull: "pulled",
+			push: "pushed",
+		});
+		assert.deepEqual(s.calls, [
+			"repoState",
+			`commit ${JSON.stringify(["learnharness backup: 2026-11-12 09:30", { all: true }])}`,
+			"push",
+		]);
+		assert.deepEqual(policyOf(seen.at(-1)), {
+			mode: "auto",
+			now: new Date(2026, 10, 12, 9, 30),
+			choices,
+			callback: "function",
+		});
+		const state = (await call(s, "state")) as Pending & { lastSync: string };
+		assert.deepEqual(
+			[state.paused, state.pendingConflicts, state.lastError, state.lastResolution, state.lastSync],
+			[false, null, null, REPORT, new Date(2026, 10, 12, 9, 30).toISOString()],
+		);
+	});
+	test("resolveConflicts that meets a new unchosen conflict stays paused with the new list", async () => {
+		const s = setup({
+			git: {
+				pull: async () => {
+					throw new ConflictError("origin/main", ["todo.md"]);
+				},
+			},
+		});
+		await assert.rejects(call(s, "resolveConflicts", { choices: { "notes.md": "local" } }), ConflictError);
+		const state = (await call(s, "state")) as Pending;
+		assert.deepEqual(
+			[state.paused, state.pendingConflicts],
+			[true, { upstream: "origin/main", files: [{ path: "todo.md" }], notes: [] }],
+		);
+		assert.equal(s.calls.includes("push"), false);
+	});
+	test("resolveConflicts rejected for a side that is not valid JSON keeps the files and their notes in state", async () => {
+		const notes = ["settings.json: the Local version is not valid JSON. Pick Remote."];
+		const s = setup({
+			git: {
+				pull: async () => {
+					throw new ConflictError("origin/main", ["notes.md", "settings.json"], notes);
+				},
+			},
+		});
+		const choices = { "notes.md": "local", "settings.json": "local" };
+		await assert.rejects(call(s, "resolveConflicts", { choices }), ConflictError);
+		const state = (await call(s, "state")) as Pending;
+		assert.deepEqual(
+			[state.paused, state.lastError, state.pendingConflicts],
+			[
+				true,
+				"Merge conflict with origin/main. Pull aborted; no files changed.",
+				{ upstream: "origin/main", files: [{ path: "notes.md" }, { path: "settings.json" }], notes },
+			],
+		);
+		assert.equal(s.calls.includes("push"), false);
 	});
 });

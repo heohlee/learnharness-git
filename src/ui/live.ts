@@ -1,5 +1,6 @@
 /** Shared view plumbing: backend state subscription scoped to a mount signal. */
 import type { PluginFrontendContext } from "learnharness-plugin-api";
+import { authHint } from "../format.ts";
 import type { State } from "../service.ts";
 
 export const DASHBOARD_VIEW = "dashboard";
@@ -18,6 +19,27 @@ export function el<K extends keyof HTMLElementTagNameMap>(
 
 export function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** Writes an error into `target`; an authentication failure becomes its fixes, one per line (artboard 03). */
+export function showError(target: HTMLElement, error: unknown): void {
+	const message = errorText(error);
+	const hint = authHint(message);
+	if (!hint) {
+		target.textContent = message;
+		return;
+	}
+	const steps = el("ol", "lhgit-steps");
+	const step = (label: string, command: string) => {
+		const item = el("li", "");
+		item.append(el("strong", "", label), el("code", "lhgit-cmd", command));
+		steps.append(item);
+	};
+	step("gh (HTTPS)", hint.gh);
+	if (hint.ssh) step("SSH", hint.ssh);
+	const box = el("div", "lhgit-auth");
+	box.append(el("strong", "lhgit-auth-title", hint.headline), el("p", "lhgit-note", hint.sub), steps);
+	target.replaceChildren(box);
 }
 
 /**
