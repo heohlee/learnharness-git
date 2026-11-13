@@ -1,6 +1,6 @@
 name: Release package
 
-# Attaches the install path 2 archive (learnharness-git-X.Y.Z.zip) to a published release.
+# Attaches the prebuilt package (learnharness-git-X.Y.Z.zip) to a published release.
 # Project-owned: not part of the kit's release.yml, which only creates the release.
 # Runs after the Release workflow succeeds: a release created with github.token does not
 # trigger `release` events for other workflows. workflow_dispatch re-attaches by hand.

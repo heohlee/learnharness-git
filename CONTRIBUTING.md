@@ -43,7 +43,7 @@ npm run coverage      # every test, failing below 85% line, branch or function c
 npm run typecheck     # TypeScript type check
 npm run lint          # Biome lint and format check (npm run lint:fix applies the fixes)
 npm pack --dry-run    # package contents
-npm run package       # builds releases/learnharness-git-<version>.zip for install path 2
+npm run package       # builds releases/learnharness-git-<version>.zip, the prebuilt package
 ```
 
 ### Security checks
@@ -69,4 +69,4 @@ The workflows in `.github/workflows/` are the source of truth for every check.
 2. Write the release notes with the [release-notes](.agents/skills/release-notes/SKILL.md) skill and save them as `.github/release-notes/vX.Y.Z.md`.
 3. Merge those changes into `main`, then tag that commit `vX.Y.Z` and push the tag.
 4. [release.yml](.github/workflows/release.yml) checks that the tag matches the `package.json` version and that the notes file exists and is not empty, runs the tests, type check, lint and `npm pack --dry-run`, then creates the GitHub release from the notes file. The package is not published to npm.
-5. [release-package.yml](.github/workflows/release-package.yml) runs when the release is published: it checks the tag against `package.json` and `manifest.json`, builds `learnharness-git-X.Y.Z.zip` and attaches it to the release (install path 2).
+5. [release-package.yml](.github/workflows/release-package.yml) runs when the release is published: it checks the tag against `package.json` and `manifest.json`, builds `learnharness-git-X.Y.Z.zip` and attaches it to the release (the prebuilt package in the README).
