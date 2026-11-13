@@ -9,8 +9,7 @@ import { fakeGit, type ScriptedCall } from "./fake-git.ts";
 const URL = "git@github.com:me/learning-data.git";
 const NOW = new Date(2026, 10, 12, 9, 5, 7);
 const STAMP = ".learnharness-git-backup/2026-11-12_09-05-07";
-const OWN_DATA =
-	"This folder already has your own sessions or knowledge graph. Cloning would mix two libraries; merge them by hand with git instead.";
+const OWN_DATA = "This folder has sessions or a graph. Clone only into a new data folder.";
 
 const INIT = ["init", "-b", "main"];
 const ADD = ["remote", "add", "origin", URL];
@@ -216,7 +215,7 @@ describe("clone failures", () => {
 			{ args: verify("main"), result: { code: 1 } },
 		]);
 		await assert.rejects(git.clone(URL, NOW), {
-			message: "The remote repository is empty. Use “Initialize repository” and connect it from Settings instead.",
+			message: "Remote is empty. Use Initialize, then connect it in Settings.",
 		});
 		fake.done();
 		assert.deepEqual(await snapshot(), before);
@@ -231,6 +230,29 @@ describe("clone failures", () => {
 		]);
 		await assert.rejects(git.clone(URL, NOW), {
 			message: "git fetch failed: fatal: Could not read from remote repository.",
+		});
+		fake.done();
+		assert.deepEqual(await snapshot(), before);
+	});
+	test("a fetch without credentials gives the authentication hint and leaves the folder as it was", async () => {
+		await write("settings.json", "local");
+		const before = await snapshot();
+		const { fake, git } = scripted([
+			{ args: INIT },
+			{ args: ADD },
+			{
+				args: FETCH,
+				result: {
+					code: 128,
+					stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n",
+				},
+			},
+			{ args: ["remote", "get-url", "origin"], result: { stdout: `${URL}\n` } },
+		]);
+		await assert.rejects(git.clone(URL, NOW), {
+			name: "AuthError",
+			message:
+				"Git authentication failed. No credentials for github.com. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL (git@github.com:me/learning-data.git).",
 		});
 		fake.done();
 		assert.deepEqual(await snapshot(), before);

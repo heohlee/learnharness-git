@@ -1,6 +1,6 @@
 /** "Clone from remote" dialog: asks for the backup repository URL and clones it into the learning data folder. */
 import type { PluginFrontendContext } from "learnharness-plugin-api";
-import { el, errorText } from "./live.ts";
+import { el, showError } from "./live.ts";
 
 export function openCloneDialog(ctx: PluginFrontendContext, signal: AbortSignal): void {
 	const dialog = ctx.ui.openDialog(
@@ -22,11 +22,7 @@ export function openCloneDialog(ctx: PluginFrontendContext, signal: AbortSignal)
 				const buttons = el("div", "lhgit-buttons");
 				root.append(
 					el("h2", "lhgit-section-title", "Clone from remote"),
-					el(
-						"p",
-						"",
-						"Use this on a new computer to bring your learning data from an existing backup repository. Files LearnHarness already created here that the backup also has are moved to .learnharness-git-backup/ first. Restart LearnHarness when it finishes.",
-					),
+					el("p", "", "Clone a backup repository here. Local files it replaces move to .learnharness-git-backup/."),
 					field,
 					error,
 					buttons,
@@ -43,7 +39,7 @@ export function openCloneDialog(ctx: PluginFrontendContext, signal: AbortSignal)
 						await ctx.call("clone", { url: input.value });
 						dialog.dispose();
 					} catch (cause) {
-						if (!dialogSignal.aborted) error.textContent = errorText(cause);
+						if (!dialogSignal.aborted) showError(error, cause);
 					} finally {
 						running = false;
 						if (!dialogSignal.aborted) cloneButton.update({ disabled: false });

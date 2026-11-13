@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
-import { ConflictError, createGit, GitError } from "../src/git.ts";
+import { AuthError, ConflictError, createGit, GitError } from "../src/git.ts";
 import { fakeGit } from "./fake-git.ts";
 
 const dir = "/data";
@@ -166,8 +166,7 @@ describe("commit", () => {
 		const fake = fakeGit([{ args: MERGING, result: { stdout: "ccc\n" } }]);
 		await assert.rejects(createGit(fake.run, dir).commit("msg", { all: true }), {
 			name: "MergeInProgressError",
-			message:
-				"A merge or unresolved conflict is in progress in the learning data folder. Finish or abort it with git; the plugin will not commit or pull until then.",
+			message: "Unfinished merge. Finish or abort it to resume sync.",
 		});
 		fake.done();
 	});
@@ -204,8 +203,7 @@ describe("commit", () => {
 		]);
 		await assert.rejects(createGit(fake.run, dir).commit("msg", { all: true }), {
 			name: "MergeInProgressError",
-			message:
-				"A merge or unresolved conflict is in progress in the learning data folder. Finish or abort it with git; the plugin will not commit or pull until then.",
+			message: "Unfinished merge. Finish or abort it to resume sync.",
 		});
 		fake.done();
 	});
@@ -258,16 +256,19 @@ describe("pull", () => {
 			{ args: HEAD, result: { stdout: "aaa\n" } },
 			{ args: ["pull", "--no-rebase", "--no-edit"], result: { code: 1, stdout: "CONFLICT (content)" } },
 			{ args: ["rev-parse", "-q", "--verify", "MERGE_HEAD"], result: { stdout: "ccc\n" } },
+			{
+				args: UNMERGED,
+				result: { stdout: "100644 a 1\tx.json\u0000100644 b 2\tx.json\u0000100644 c 3\tx.json\u0000" },
+			},
 			{ args: ["merge", "--abort"] },
 		]);
 		const error = await createGit(fake.run, dir)
 			.pull()
 			.catch((e: unknown) => e);
 		assert.ok(error instanceof ConflictError);
-		assert.equal(
-			error.message,
-			"Pull stopped by a merge conflict. The merge was aborted and your files are unchanged; resolve it manually with git.",
-		);
+		assert.equal(error.message, "Merge conflict with origin/main. Pull aborted; no files changed.");
+		assert.equal(error.upstream, "origin/main");
+		assert.deepEqual(error.files, ["x.json"]);
 		fake.done();
 	});
 	test("throws GitError on other pull failures", async () => {
@@ -318,6 +319,7 @@ describe("log", () => {
 		"-n50",
 		"--format=%x1e%H%x1f%h%x1f%an%x1f%aI%x1f%s",
 		"--name-status",
+		"--diff-merges=first-parent",
 	];
 	test("returns no commits on an unborn branch", async () => {
 		const fake = fakeGit([{ args: HEAD, result: { code: 1 } }]);
@@ -327,7 +329,8 @@ describe("log", () => {
 	test("parses commits with the files each one touched", async () => {
 		const stdout =
 			"\x1eaaaa1111\x1faaaa\x1fAda\x1f2026-11-12T10:00:00-03:00\x1fsecond\n\nM\tgraph.json\nR100\told.json\tnew.json\n" +
-			"\x1ebbbb2222\x1fbbbb\x1fAda\x1f2026-11-11T09:00:00-03:00\x1fmerge\n";
+			"\x1ebbbb2222\x1fbbbb\x1fAda\x1f2026-11-11T09:00:00-03:00\x1fmerge\n\nM\tsettings.json\nA\tchats/b.json\n" +
+			"\x1ecccc3333\x1fcccc\x1fAda\x1f2026-11-10T08:00:00-03:00\x1fempty merge\n";
 		const fake = fakeGit([
 			{ args: HEAD, result: { stdout: "aaaa1111\n" } },
 			{ args: LOG, result: { stdout } },
@@ -350,9 +353,21 @@ describe("log", () => {
 				author: "Ada",
 				date: "2026-11-11T09:00:00-03:00",
 				subject: "merge",
+				files: [
+					{ path: "settings.json", code: "M" },
+					{ path: "chats/b.json", code: "A" },
+				],
+			},
+			{
+				hash: "cccc3333",
+				shortHash: "cccc",
+				author: "Ada",
+				date: "2026-11-10T08:00:00-03:00",
+				subject: "empty merge",
 				files: [],
 			},
 		]);
+		fake.done();
 	});
 });
 
@@ -443,6 +458,98 @@ describe("remote", () => {
 	test("removeRemote removes origin", async () => {
 		const fake = fakeGit([{ args: ["remote", "remove", "origin"] }]);
 		await createGit(fake.run, dir).removeRemote();
+		fake.done();
+	});
+});
+
+describe("authentication failures", () => {
+	const GET_URL = ["remote", "get-url", "origin"];
+	const PULL = ["pull", "--no-rebase", "--no-edit"];
+	const hint = (host: string, ssh: string) =>
+		`Git authentication failed. No credentials for ${host}. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL (${ssh}).`;
+	const UNKNOWN =
+		"Git authentication failed. No credentials for the remote. Set up one, then retry: gh auth login && gh auth setup-git, or use an SSH URL.";
+	const pullFailing = (stderr: string, url: { code?: number; stdout?: string }) =>
+		fakeGit([
+			clean("main...origin/main"),
+			...noMerge,
+			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: PULL, result: { code: 1, stderr } },
+			{ args: MERGING, result: { code: 1 } },
+			{ args: GET_URL, result: url },
+		]);
+	const cases: [string, string, string][] = [
+		[
+			"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n",
+			"https://github.com/me/data.git\n",
+			hint("github.com", "git@github.com:me/data.git"),
+		],
+		[
+			"remote: Invalid username or password.\nfatal: Authentication failed for 'https://gitlab.com/me/data/'\n",
+			"https://gitlab.com/me/data\n",
+			hint("gitlab.com", "git@gitlab.com:me/data"),
+		],
+		[
+			"git@github.com: Permission denied (publickey).\n",
+			"git@github.com:me/data.git\n",
+			hint("github.com", "git@github.com:me/data.git"),
+		],
+		[
+			"fatal: Authentication failed\n",
+			"ssh://git@codeberg.org/me/data.git\n",
+			hint("codeberg.org", "git@codeberg.org:me/data.git"),
+		],
+		["fatal: Authentication failed\n", "/srv/git/data.git\n", UNKNOWN],
+	];
+	for (const [stderr, url, message] of cases) {
+		test(`pull maps ${JSON.stringify(stderr.slice(0, 40))} from ${url.trim()} to an authentication hint`, async () => {
+			const fake = pullFailing(stderr, { stdout: url });
+			const error = await createGit(fake.run, dir)
+				.pull()
+				.catch((e: unknown) => e);
+			assert.ok(error instanceof AuthError);
+			assert.equal(error.message, message);
+			assert.equal(error.detail, stderr.trim());
+			fake.done();
+		});
+	}
+	test("pull without origin still gives the hint", async () => {
+		const fake = pullFailing("fatal: Authentication failed\n", { code: 2 });
+		await assert.rejects(createGit(fake.run, dir).pull(), { name: "AuthError", message: UNKNOWN });
+		fake.done();
+	});
+	test("push maps an authentication failure", async () => {
+		const fake = fakeGit([
+			clean("main...origin/main [ahead 1]"),
+			{ args: ["push"], result: { code: 128, stderr: "fatal: could not read Username: terminal prompts disabled" } },
+			{ args: GET_URL, result: { stdout: "https://github.com/me/data.git\n" } },
+		]);
+		await assert.rejects(createGit(fake.run, dir).push(), {
+			name: "AuthError",
+			message: hint("github.com", "git@github.com:me/data.git"),
+		});
+		fake.done();
+	});
+	test("publish (connect remote) maps an authentication failure", async () => {
+		const fake = fakeGit([
+			{ args: ["push", "-u", "origin", "main"], result: { code: 128, stderr: "Permission denied (publickey)." } },
+			{ args: GET_URL, result: { stdout: "git@github.com:me/data.git\n" } },
+		]);
+		await assert.rejects(createGit(fake.run, dir).publish("main"), {
+			name: "AuthError",
+			message: hint("github.com", "git@github.com:me/data.git"),
+		});
+		fake.done();
+	});
+	test("other failures keep git's message", async () => {
+		const fake = fakeGit([
+			clean("main...origin/main [ahead 1]"),
+			{ args: ["push"], result: { code: 1, stderr: "! [rejected] main -> main (fetch first)" } },
+		]);
+		await assert.rejects(createGit(fake.run, dir).push(), {
+			name: "GitError",
+			message: "git push failed: ! [rejected] main -> main (fetch first)",
+		});
 		fake.done();
 	});
 });

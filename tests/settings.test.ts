@@ -13,6 +13,14 @@ describe("mergeSettings", () => {
 			autoPush: true,
 		});
 	});
+	test("resolves conflicts automatically by default and accepts manual", () => {
+		assert.equal(DEFAULT_SETTINGS.conflictMode, "auto");
+		assert.equal(mergeSettings(DEFAULT_SETTINGS, { conflictMode: "manual" }).conflictMode, "manual");
+		assert.equal(
+			mergeSettings({ ...DEFAULT_SETTINGS, conflictMode: "manual" }, { conflictMode: "auto" }).conflictMode,
+			"auto",
+		);
+	});
 	test("ignores unknown keys", () => {
 		assert.deepEqual(mergeSettings(DEFAULT_SETTINGS, { other: 1 }), DEFAULT_SETTINGS);
 	});
@@ -24,6 +32,8 @@ describe("mergeSettings", () => {
 		["autoPush", 1, "Push after auto commit must be true or false."],
 		["commitMessage", "   ", "Commit message template must not be empty."],
 		["commitMessage", "x".repeat(201), "Commit message template must be at most 200 characters."],
+		["conflictMode", "newest", "Conflicts must be automatic or manual."],
+		["conflictMode", 1, "Conflicts must be automatic or manual."],
 	];
 	for (const [key, value, message] of invalid) {
 		test(`rejects ${key}=${JSON.stringify(value).slice(0, 20)}`, () => {

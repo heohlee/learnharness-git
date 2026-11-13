@@ -73,8 +73,7 @@ export function mountHistory(ctx: PluginFrontendContext, container: HTMLElement,
 			if (state.repo.kind !== "repo") {
 				commits = [];
 				render();
-				note.textContent =
-					"The learning data folder is not a Git repository yet. Initialize it or clone a backup from the Git view.";
+				note.textContent = "No Git repository yet.";
 				return;
 			}
 			const [next, name] = await Promise.all([

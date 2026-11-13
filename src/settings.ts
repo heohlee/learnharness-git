@@ -2,6 +2,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+/** How a pull that stops on merge conflicts is resolved: by per-file rules, or by the user. */
+export type ConflictMode = "auto" | "manual";
+
 export interface Settings {
 	/** Minutes between automatic commits; 0 disables automation. */
 	autoSyncMinutes: number;
@@ -10,6 +13,7 @@ export interface Settings {
 	autoPush: boolean;
 	/** Template for automatic and default commit messages; `{{date}}` is replaced. */
 	commitMessage: string;
+	conflictMode: ConflictMode;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -17,6 +21,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
 	pullOnStart: false,
 	autoPush: false,
 	commitMessage: "learnharness backup: {{date}}",
+	conflictMode: "auto",
 });
 
 function boolean(value: unknown, label: string): boolean {
@@ -45,6 +50,11 @@ export function mergeSettings(current: Readonly<Settings>, changes: unknown): Se
 		if (typeof value !== "string" || !value.trim()) throw new Error("Commit message template must not be empty.");
 		if (value.length > 200) throw new Error("Commit message template must be at most 200 characters.");
 		next.commitMessage = value;
+	}
+	if ("conflictMode" in input) {
+		const value = input.conflictMode;
+		if (value !== "auto" && value !== "manual") throw new Error("Conflicts must be automatic or manual.");
+		next.conflictMode = value;
 	}
 	return next;
 }
