@@ -1,4 +1,4 @@
-// Builds the release archive for install path 2: releases/learnharness-git-<version>.zip
+// Builds the prebuilt package (release archive): releases/learnharness-git-<version>.zip
 // holding learnharness-git/dist/**, ready to extract into the LearnHarness plugins folder.
 // Node built-ins only (no zip tool needed). Run `npm run build` first (the npm script does).
 import fs from "node:fs";

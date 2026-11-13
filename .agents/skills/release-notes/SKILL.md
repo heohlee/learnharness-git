@@ -45,7 +45,7 @@ Use when drafting or revising release text. Do not use for bumping versions, bui
 Return the version-only title and Markdown body, plus a separate private evidence summary: target/range, change sources and unresolved facts or links. Keep that summary out of the public text. Never claim publication.
 
 <!-- local: publication -->
-Releases are tag-driven: the tag is `vX.Y.Z` and must match the `version` in both `package.json` and `manifest.json`. Store the approved notes as `.github/release-notes/vX.Y.Z.md` on `main` before pushing the tag. On the tag, `.github/workflows/release.yml` verifies and creates the GitHub release from that file (no npm publish); `.github/workflows/release-package.yml` then builds and attaches `learnharness-git-X.Y.Z.zip`, the archive for install path 2 in the README.
+Releases are tag-driven: the tag is `vX.Y.Z` and must match the `version` in both `package.json` and `manifest.json`. Store the approved notes as `.github/release-notes/vX.Y.Z.md` on `main` before pushing the tag. On the tag, `.github/workflows/release.yml` verifies and creates the GitHub release from that file (no npm publish); `.github/workflows/release-package.yml` then builds and attaches `learnharness-git-X.Y.Z.zip`, the prebuilt package in the README.
 <!-- /local: publication -->
 
 ## References

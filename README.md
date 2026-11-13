@@ -42,14 +42,23 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 - LearnHarness 0.6.1 or newer (desktop app).
 - `git` 2.31 or newer on the `PATH`.
 - For a remote: SSH keys, or HTTPS with a credential helper (for GitHub: `gh auth login && gh auth setup-git`). The plugin never asks for a password.
-- Install paths 1 and 3 also need Node.js 24 or newer and npm.
+- Install paths 2 and 3 also need Node.js 24 or newer and npm.
 
 ## Install
 
 Find the plugins folder in **Settings → Community plugins** (by default on Linux:
 `~/.config/LearnHarness/data/plugins`).
 
-### 1. From source, inside the plugins folder (recommended)
+### 1. Prebuilt package (recommended)
+
+Download `learnharness-git-<version>.zip` from the [releases](https://github.com/heohlee/learnharness-git/releases).
+It already contains the `learnharness-git/` folder: extract it directly into the plugins folder, so that
+`<plugins folder>/learnharness-git/dist/manifest.json` exists.
+
+To update: replace only `learnharness-git/dist/` with the new one (keep `learnharness-git/data/`, which holds
+the plugin settings), then restart LearnHarness.
+
+### 2. From source, inside the plugins folder
 
 ```sh
 git clone https://github.com/heohlee/learnharness-git.git "<plugins folder>/learnharness-git"
@@ -60,13 +69,10 @@ npm run build
 
 To update: `git pull && npm ci && npm run build`, then restart LearnHarness.
 
-### 2. Prebuilt package
-
-Download `learnharness-git-<version>.zip` from the [releases](https://github.com/heohlee/learnharness-git/releases)
-and extract it into the plugins folder, so that `<plugins folder>/learnharness-git/dist/manifest.json` exists.
-
-To update: replace only `learnharness-git/dist/` with the new one (keep `learnharness-git/data/`, which holds
-the plugin settings), then restart LearnHarness.
+The clone has its own `.git`, so the plugin keeps `plugins/learnharness-git/` out of your backup (in
+`.git/info/exclude`, on this computer only), and its settings in `data/` are not backed up. The same applies to any
+plugin installed with `git clone`. If v0.1.0 already committed the folder, remove it from the backup once with
+`git rm --cached plugins/learnharness-git` in the learning data folder, then commit.
 
 ### 3. From a separate checkout (development)
 
@@ -81,8 +87,7 @@ npm run install:local -- "<plugins folder>"
 
 ### Turn it on
 
-**Settings → Community plugins → Refresh plugins**, open Settings again and turn on **Enable Git**.
-**Git** appears in the sidebar.
+**Settings → Community plugins → Refresh plugins**, then turn on **Enable Git**. **Git** appears in the sidebar.
 
 ## Usage
 
@@ -148,7 +153,7 @@ npm ci
 npm run coverage   # tests with an 85% line, branch and function minimum
 npm run typecheck
 npm run lint
-npm run package    # releases/learnharness-git-<version>.zip for install path 2
+npm run package    # releases/learnharness-git-<version>.zip, the prebuilt package
 ```
 
 ## License
