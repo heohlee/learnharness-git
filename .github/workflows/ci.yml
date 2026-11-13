@@ -53,6 +53,11 @@ jobs:
         run: npm pack --dry-run
 
       # local: ci-steps
+      # Builds the install path 2 archive (releases/learnharness-git-<version>.zip).
+      - name: Package
+        run: |
+          npm run package
+          test -f releases/learnharness-git-$(node -p "require('./package.json').version").zip
       # /local: ci-steps
 
   ci:
