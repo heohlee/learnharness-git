@@ -380,25 +380,17 @@ describe("remote", () => {
 		assert.deepEqual(s.calls, ["repoState", "listFiles", "status", `historyFiles ${JSON.stringify(["main"])}`]);
 		assert.deepEqual(s.events, []);
 	});
+	const credential = "Do not put credentials in the remote URL. Use SSH keys or a Git credential helper.";
 	const invalid: [unknown, string][] = [
 		["", "Remote URL must not be empty."],
 		["  ", "Remote URL must not be empty."],
 		["git@host:a b.git", "Remote URL must not contain spaces."],
 		["--upload-pack=x", "Remote URL must not start with “-”."],
-		[
-			"https://me:abc123@github.com/me/data.git",
-			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
-		],
+		["https://me:abc123@github.com/me/data.git", credential],
 		[3, "Remote URL must not be empty."],
 		["git@h:a\nb.git", "Remote URL must not contain spaces."],
-		[
-			"https://ghp_abcdef123456@github.com/me/data.git",
-			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
-		],
-		[
-			"https://github.com/me/data.git?access_token=abc",
-			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
-		],
+		["https://ghp_abcdef123456@github.com/me/data.git", credential],
+		["https://github.com/me/data.git?access_token=abc", credential],
 	];
 	for (const [url, message] of invalid) {
 		test(`rejects remote URL ${JSON.stringify(url)} without running git`, async () => {
@@ -414,6 +406,51 @@ describe("remote", () => {
 		const url = "https://me@github.com/me/data.git";
 		assert.equal(((await call(s, "previewRemote", { url })) as { url: string }).url, url);
 	});
+	const embedded: [string, string][] = [
+		["a password", "https://me:abc123@github.com/me/data.git"],
+		["a percent-encoded colon in the user name", "https://me%3Aabc123@github.com/me/data.git"],
+		["a percent-encoded “@” in the user name", "https://me%40corp@github.com/me/data.git"],
+		["a percent-encoded token name as the user name", "https://%74oken@github.com/me/data.git"],
+		["a percent-encoded token prefix as the user name", "https://%67hp_abcdef123456@github.com/me/data.git"],
+		["a token as the user name", "https://ghp_abcdef123456@github.com/me/data.git"],
+		["a password in an ssh URL", "ssh://me:abc123@github.com/me/data.git"],
+		["a token in a query key and value", "https://github.com/me/data.git?access_token=ghp_abc123"],
+		["a token in a percent-encoded query key", "https://github.com/me/data.git?%74oken=abc"],
+		["a token in a query value", "https://github.com/me/data.git?auth=ghp_abc123"],
+		["a token in the fragment", "https://github.com/me/data.git#access_token=abc"],
+	];
+	for (const [why, url] of embedded) {
+		test(`rejects ${why} without running git or changing state`, async () => {
+			const s = setup();
+			const before = await call(s, "state");
+			s.calls.length = 0;
+			s.events.length = 0;
+			await assert.rejects(call(s, "previewRemote", { url }), { message: credential });
+			await assert.rejects(call(s, "connectRemote", { url }), { message: credential });
+			await assert.rejects(call(s, "clone", { url }), { message: credential });
+			assert.deepEqual(s.calls, []);
+			assert.deepEqual(s.events, []);
+			assert.deepEqual(await call(s, "state"), before);
+		});
+	}
+	const plain: [string, string][] = [
+		["an scp-style SSH remote", "git@github.com:me/learning-data.git"],
+		["an ssh URL with a user name", "ssh://git@github.com/me/data.git"],
+		["a plain https URL", "https://github.com/me/data.git"],
+		["a plain http URL", "http://github.com/me/data.git"],
+		["a user name without a password", "https://me@github.com/me/data.git"],
+		["an https URL with a path naming a token", "https://github.com/me/token-data.git"],
+		["a local path", "/home/me/learning-data"],
+		["a relative local path", "learning-data"],
+		["a file URL", "file:///home/me/learning-data"],
+	];
+	for (const [why, url] of plain) {
+		test(`accepts ${why}`, async () => {
+			const s = setup();
+			assert.equal(((await call(s, "previewRemote", { url })) as { url: string }).url, url);
+			assert.deepEqual(s.calls, ["repoState", "listFiles", "status", `historyFiles ${JSON.stringify(["main"])}`]);
+		});
+	}
 	test("connectRemote commits pending changes, sets origin and pushes with upstream", async () => {
 		const s = setup();
 		assert.deepEqual(await call(s, "connectRemote", { url: ` ${URL} ` }), { remote: URL });

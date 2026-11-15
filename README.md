@@ -29,7 +29,7 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 </p>
 
 - **Automatic sync**: commit, pull and push every N minutes; pull on startup.
-- **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history.
+- **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history. A URL that carries a password or a token, in plain or percent-encoded form anywhere in it, is refused with a reminder to use SSH keys or a credential helper.
 - **Second computer**: clone an existing backup; replaced local files go to `.learnharness-git-backup/`.
 - **Clean clone failure**: a clone that cannot write every file fails instead of reporting success, keeps or restores what was there, and can be retried.
 - **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff). A session you deleted in the app is not brought back by sync, deletions survive on both sides, and you are never asked about the app's own files; the notice names what was kept.
