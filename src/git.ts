@@ -282,6 +282,25 @@ function writeExcludeBlock(file: string, lines: readonly string[]): void {
 	fs.writeFileSync(file, next);
 }
 
+/**
+ * Real location of `target`, resolving symlinks in the deepest part that exists, so a path git only reports as
+ * deleted can still be checked through the folders that remain.
+ */
+function realLocation(target: string): string {
+	let current = target;
+	const rest: string[] = [];
+	for (;;) {
+		try {
+			return path.join(fs.realpathSync(current), ...rest);
+		} catch {
+			const parent = path.dirname(current);
+			if (parent === current) return target;
+			rest.unshift(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
 export function createGit(run: GitRunner, cwd: string) {
 	async function fail(args: readonly string[], result: GitResult): Promise<never> {
 		if (AUTH_FAILURE.test(result.stderr)) throw new AuthError(await remoteUrl(), result.stderr.trim());
@@ -453,6 +472,24 @@ export function createGit(run: GitRunner, cwd: string) {
 	async function status(): Promise<Status> {
 		return parseStatus((await exec(["status", "--porcelain=v1", "--branch", "-z", "-uall"])).stdout);
 	}
+	/**
+	 * Refuses a diffed path whose real location is outside the data directory: an absolute path, a `..` segment, a
+	 * sibling folder that merely shares the folder's name prefix, or a symlink redirecting the file or a parent. The
+	 * check runs before any git call, so a refused path changes nothing. Only the requested path is named: the
+	 * location it would resolve to is never echoed back.
+	 */
+	function confine(file: string): void {
+		const fail = (): never => {
+			throw new Error(
+				`Cannot show ${JSON.stringify(file)}: the change viewer only shows a relative path that resolves inside the learning-data folder.`,
+			);
+		};
+		// An absolute path is refused even when it points inside the folder, so one rule covers every caller.
+		if (path.isAbsolute(file) || path.win32.isAbsolute(file)) fail();
+		const root = realLocation(path.resolve(cwd));
+		const relative = path.relative(root, realLocation(path.resolve(cwd, file)));
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) fail();
+	}
 
 	return {
 		/** Whether the data directory itself is the top level of a repository. */
@@ -484,6 +521,7 @@ export function createGit(run: GitRunner, cwd: string) {
 			await exec(paths.length ? [LITERAL, "reset", "-q", "--", ...paths] : [LITERAL, "reset", "-q"]);
 		},
 		async diff(file: string, options: { staged: boolean; untracked: boolean }): Promise<string> {
+			confine(file);
 			if (options.untracked) {
 				return (await exec([LITERAL, "diff", "--no-color", "--no-index", "--", "/dev/null", file], [0, 1])).stdout;
 			}

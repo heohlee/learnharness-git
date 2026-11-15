@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import {
 	ConflictError,
+	createGit,
 	type Git,
 	MergeInProgressError,
 	type PullPolicy,
@@ -10,6 +14,7 @@ import {
 } from "../src/git.ts";
 import { type Clock, createService } from "../src/service.ts";
 import { DEFAULT_SETTINGS, type Settings } from "../src/settings.ts";
+import { fakeGit } from "./fake-git.ts";
 
 function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: Partial<Git> } = {}) {
 	const calls: string[] = [];
@@ -316,6 +321,46 @@ describe("handlers", () => {
 		await assert.rejects(call(s, "status"), { message: "locked" });
 		assert.deepEqual(s.events, []);
 		assert.equal(((await call(s, "state")) as { lastError: null }).lastError, null);
+	});
+});
+
+describe("diff confinement", () => {
+	let base = "";
+	let root = "";
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-service-diff-"));
+		root = path.join(base, "data");
+		await fs.mkdir(path.join(root, "notes"), { recursive: true });
+		await fs.writeFile(path.join(root, "notes", "nested.json"), "{}\n");
+		await fs.writeFile(path.join(base, "secret.txt"), "outside\n");
+	});
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	test("the diff handler refuses a path outside the data folder and spawns no git call", async () => {
+		const fake = fakeGit([{ args: ["rev-parse", "--show-toplevel"], result: { stdout: `${root}\n` } }]);
+		const s = setup({ git: createGit(fake.run, root) });
+		await assert.rejects(call(s, "diff", { path: "../secret.txt", staged: false, untracked: true }), {
+			message:
+				'Cannot show "../secret.txt": the change viewer only shows a relative path that resolves inside the learning-data folder.',
+		});
+		// Only the repository check ran: the refused diff spawned nothing.
+		assert.deepEqual(fake.calls, [{ args: ["rev-parse", "--show-toplevel"], cwd: root }]);
+		fake.done();
+		assert.deepEqual(s.events, []);
+	});
+	test("the diff handler still shows an untracked nested file", async () => {
+		const fake = fakeGit([
+			{ args: ["rev-parse", "--show-toplevel"], result: { stdout: `${root}\n` } },
+			{
+				args: ["--literal-pathspecs", "diff", "--no-color", "--no-index", "--", "/dev/null", "notes/nested.json"],
+				result: { code: 1, stdout: "+{}" },
+			},
+		]);
+		const s = setup({ git: createGit(fake.run, root) });
+		assert.equal(await call(s, "diff", { path: "notes/nested.json", staged: false, untracked: true }), "+{}");
+		fake.done();
 	});
 });
 

@@ -16,7 +16,7 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 
 ## Features
 
-- **Git view**: backup status, Sync now and pending changes (stage, unstage, diff, commit). Click "Backed up …" to open Git History.
+- **Git view**: backup status, Sync now and pending changes (stage, unstage, diff, commit). Click "Backed up …" to open Git History. The change viewer only reads inside the learning-data folder: a path that leaves it, including through a symlink, shows an error instead of a diff.
 
 <p align="center">
 <img src="docs/images/git-view.png" alt="The Git view: backup status with Sync now, three pending changes and a commit box" width="760">
