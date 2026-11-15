@@ -32,7 +32,7 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 - **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history.
 - **Second computer**: clone an existing backup; replaced local files go to `.learnharness-git-backup/`.
 - **Clean clone failure**: a clone that cannot write every file fails instead of reporting success, keeps or restores what was there, and can be retried.
-- **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff). A session you deleted in the app is not brought back by sync, and you are never asked about the app's own files.
+- **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff). A session you deleted in the app is not brought back by sync, deletions survive on both sides, and you are never asked about the app's own files; the notice names what was kept.
 - **Valid JSON only**: invalid JSON is never committed.
 - **Safe with your Git work**: never touches a merge, rebase, cherry-pick or revert you started.
 - **Clear auth errors**: suggests `gh auth setup-git` or an SSH URL.
@@ -141,14 +141,14 @@ graph/*.jsonl merge=union
 <img src="docs/images/settings.png" alt="Settings, Git page: auto sync every 10 minutes, pull and push after each automatic commit, pull on startup, the commit message template, Conflicts and the remote URL" width="760">
 </p>
 
-| Setting                                   | Default                             | Description                                                                      |
-| ----------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------- |
-| Auto sync interval (minutes)              | `0`                                 | Commit every N minutes; `0` turns it off.                                        |
-| Pull and push after each automatic commit | off                                 | Needs an upstream branch.                                                        |
-| Pull when LearnHarness starts             | off                                 | Pull once at startup.                                                            |
-| Commit message template                   | `learnharness backup: {{date}}`     | For automatic commits and when the message box is empty.                         |
-| Conflicts                                 | Resolve automatically (newest wins) | Or **Ask me** to pick Local / Remote for every conflicted file.                  |
-| Remote URL                                | (none)                              | `origin`; saving it pushes after you confirm. No passwords or tokens in the URL. |
+| Setting                                   | Default                         | Description                                                                                                                     |
+| ----------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Auto sync interval (minutes)              | `0`                             | Commit every N minutes; `0` turns it off.                                                                                       |
+| Pull and push after each automatic commit | off                             | Needs an upstream branch.                                                                                                       |
+| Pull when LearnHarness starts             | off                             | Pull once at startup.                                                                                                           |
+| Commit message template                   | `learnharness backup: {{date}}` | For automatic commits and when the message box is empty.                                                                        |
+| Conflicts                                 | Resolve automatically           | Newest wins for ordinary files, deletions are kept, the other side is backed up. Or **Ask me** to pick Local / Remote per file. |
+| Remote URL                                | (none)                          | `origin`; saving it pushes after you confirm. No passwords or tokens in the URL.                                                |
 
 ## Privacy
 

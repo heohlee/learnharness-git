@@ -205,24 +205,69 @@ describe("conflict texts", () => {
 	test("filesLeft names how many files still need a version", () => {
 		assert.deepEqual([filesLeft(1), filesLeft(2)], ["1 file left.", "2 files left."]);
 	});
-	test("resolvedNotice says the newest version was kept when every file followed a rule", () => {
-		const auto = (file: string) => ({ path: file, kept: "local" as const, rule: "newer commit" });
+	test("resolvedNotice says the newest version was kept when every file followed a newest-wins rule", () => {
+		const auto = (file: string, rule: string) => ({ path: file, kept: "local" as const, rule });
 		assert.deepEqual(
 			[
-				resolvedNotice([auto("a.json")]),
-				resolvedNotice([auto("a.json"), { ...auto("b.jsonl"), kept: "both", rule: "union merge" }]),
+				resolvedNotice([auto("a.json", "newer commit")]),
+				resolvedNotice([auto("chats/a.json", "newer session"), auto("graph/format.json", "higher version")]),
 			],
 			["Merge conflict in 1 file resolved: newest kept.", "Merge conflict in 2 files resolved: newest kept."],
 		);
 	});
-	test("resolvedNotice drops 'newest kept' when any file was the user's choice", () => {
+	test("resolvedNotice says the deletion was kept when every file kept one", () => {
+		assert.deepEqual(
+			[
+				resolvedNotice([{ path: "chats/a.json", kept: "local", rule: "deletion kept" }]),
+				resolvedNotice([
+					{ path: "chats/doomed-chat.json", kept: "local", rule: "deletion kept" },
+					{ path: "graph/nodes.jsonl", kept: "both", rule: "union merge, deletions kept" },
+				]),
+			],
+			["Merge conflict in 1 file resolved: deletion kept.", "Merge conflict in 2 files resolved: deletions kept."],
+		);
+	});
+	test("resolvedNotice counts the files that kept a deletion when a newest rule decided the rest", () => {
+		assert.deepEqual(
+			[
+				resolvedNotice([
+					{ path: "chats/doomed-chat.json", kept: "local", rule: "deletion kept" },
+					{ path: "settings.json", kept: "remote", rule: "newer commit" },
+				]),
+				resolvedNotice([
+					{ path: "chats/doomed-chat.json", kept: "local", rule: "deletion kept" },
+					{ path: "graph/nodes.jsonl", kept: "both", rule: "union merge, deletions kept" },
+					{ path: "chats/b.json", kept: "local", rule: "newer session" },
+				]),
+			],
+			[
+				"Merge conflict in 2 files resolved: 1 of 2 files kept a deletion.",
+				"Merge conflict in 3 files resolved: 2 of 3 files kept a deletion.",
+			],
+		);
+	});
+	test("resolvedNotice claims no rule when a tie or a modified side decided every file", () => {
+		assert.deepEqual(
+			[
+				resolvedNotice([{ path: "settings.json", kept: "local", rule: "tie, local kept" }]),
+				resolvedNotice([{ path: "settings.json", kept: "remote", rule: "modified kept" }]),
+			],
+			["Merge conflict in 1 file resolved.", "Merge conflict in 1 file resolved."],
+		);
+	});
+	test("resolvedNotice claims no rule when any file was the user's choice", () => {
 		const chosen = (file: string) => ({ path: file, kept: "remote" as const, rule: "your choice" });
 		assert.deepEqual(
 			[
 				resolvedNotice([chosen("a.json")]),
 				resolvedNotice([chosen("a.json"), { path: "b.json", kept: "local", rule: "newer commit" }]),
+				resolvedNotice([chosen("a.json"), { path: "c.json", kept: "local", rule: "deletion kept" }]),
 			],
-			["Merge conflict in 1 file resolved.", "Merge conflict in 2 files resolved."],
+			[
+				"Merge conflict in 1 file resolved.",
+				"Merge conflict in 2 files resolved.",
+				"Merge conflict in 2 files resolved.",
+			],
 		);
 	});
 	test("conflictMessage names the upstream and isConflictMessage recognizes only it", () => {

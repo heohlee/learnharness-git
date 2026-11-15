@@ -145,10 +145,26 @@ export function filesLeft(files: number): string {
 	return `${plural(files, "file")} left.`;
 }
 
-/** One-line notice after a resolution; "newest kept" only when no file was the user's choice. */
+/** Rules that keep a side because it is the newest: session time, format version or last commit date. */
+const NEWEST_RULES = new Set(["newer session", "higher version", "newer commit"]);
+
+/** Whether a rule kept a deletion rather than choosing between two versions of the file. */
+const keepsDeletion = (rule: string): boolean => rule === "deletion kept" || rule.endsWith("deletions kept");
+
+/**
+ * One-line notice after a resolution. It names a rule only when that rule decided every file: "newest kept" when all
+ * of them were newest wins, "deletions kept" when none chose a side, otherwise how many files kept a deletion. A file
+ * the user picked or that no rule names leaves the notice without a rule, so it never claims a choice nobody made.
+ */
 export function resolvedNotice(files: readonly ResolvedFile[]): string {
 	const text = `Merge conflict in ${plural(files.length, "file")} resolved`;
-	return files.some((file) => file.rule === "your choice") ? `${text}.` : `${text}: newest kept.`;
+	if (files.length === 0) return `${text}.`;
+	if (files.some((file) => file.rule === "your choice")) return `${text}.`;
+	const deletions = files.filter((file) => keepsDeletion(file.rule)).length;
+	if (deletions === files.length) return `${text}: ${deletions === 1 ? "deletion kept" : "deletions kept"}.`;
+	if (files.every((file) => NEWEST_RULES.has(file.rule))) return `${text}: newest kept.`;
+	if (deletions > 0) return `${text}: ${deletions} of ${plural(files.length, "file")} kept a deletion.`;
+	return `${text}.`;
 }
 
 /** Message of a pull aborted on conflicts. */
