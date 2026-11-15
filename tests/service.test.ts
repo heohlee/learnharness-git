@@ -418,6 +418,11 @@ describe("remote", () => {
 		["a token in a percent-encoded query key", "https://github.com/me/data.git?%74oken=abc"],
 		["a token in a query value", "https://github.com/me/data.git?auth=ghp_abc123"],
 		["a token in the fragment", "https://github.com/me/data.git#access_token=abc"],
+		["a GitLab token as the user name", "https://glpat_abcdef123456@github.com/me/data.git"],
+		["a password parameter", "https://github.com/me/data.git?password=abc123"],
+		["a percent-encoded token name in the fragment", "https://github.com/me/data.git#%74oken=abc"],
+		["a percent-encoded token value in the query", "https://github.com/me/data.git?auth=%67hp_abc123"],
+		["a percent-encoded colon in an ssh user name", "ssh://me%3Aabc123@github.com/me/data.git"],
 	];
 	for (const [why, url] of embedded) {
 		test(`rejects ${why} without running git or changing state`, async () => {
@@ -443,6 +448,9 @@ describe("remote", () => {
 		["a local path", "/home/me/learning-data"],
 		["a relative local path", "learning-data"],
 		["a file URL", "file:///home/me/learning-data"],
+		["an uppercase host", "https://GitHub.com/me/data.git"],
+		["a percent-encoded path segment", "https://github.com/me/my%20data.git"],
+		["an ssh URL with a port", "ssh://git@github.com:22/me/data.git"],
 	];
 	for (const [why, url] of plain) {
 		test(`accepts ${why}`, async () => {

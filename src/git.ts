@@ -301,6 +301,26 @@ function realLocation(target: string): string {
 	}
 }
 
+/** Separators of a relative path on this platform: both forms on Windows, only “/” elsewhere. */
+const SEPARATORS = path.sep === "/" ? "/" : /[/\\]/;
+
+/**
+ * Physical location of the relative path `file` read from `from`: the segments are walked in order against the real
+ * filesystem instead of being collapsed lexically. A normal segment is appended and resolved at once when it exists,
+ * so a symlink in the middle becomes its target, `..` then steps to the parent of that physical location, and `.`
+ * does nothing. The kernel resolves a symlink before applying a following `..`, so a lexical join would let
+ * `linked/../outside/file` look inside while git reads a file outside.
+ */
+function physicalLocation(from: string, file: string): string {
+	let current = from;
+	for (const segment of file.split(SEPARATORS)) {
+		if (segment === "" || segment === ".") continue;
+		// A root is its own parent, so any number of “..” above it stays there.
+		current = segment === ".." ? path.dirname(current) : realLocation(path.join(current, segment));
+	}
+	return current;
+}
+
 export function createGit(run: GitRunner, cwd: string) {
 	async function fail(args: readonly string[], result: GitResult): Promise<never> {
 		if (AUTH_FAILURE.test(result.stderr)) throw new AuthError(await remoteUrl(), result.stderr.trim());
@@ -473,10 +493,10 @@ export function createGit(run: GitRunner, cwd: string) {
 		return parseStatus((await exec(["status", "--porcelain=v1", "--branch", "-z", "-uall"])).stdout);
 	}
 	/**
-	 * Refuses a diffed path whose real location is outside the data directory: an absolute path, a `..` segment, a
-	 * sibling folder that merely shares the folder's name prefix, or a symlink redirecting the file or a parent. The
-	 * check runs before any git call, so a refused path changes nothing. Only the requested path is named: the
-	 * location it would resolve to is never echoed back.
+	 * Refuses a diffed path whose physical location is outside the data directory: an absolute path, a `..` segment
+	 * walking out, a sibling folder that merely shares the folder's name prefix, or a symlink redirecting the file or
+	 * a parent. Only the requested path is named: the location it would resolve to is never echoed back. The check
+	 * runs before any git call, so a refused path changes nothing.
 	 */
 	function confine(file: string): void {
 		const fail = (): never => {
@@ -487,7 +507,7 @@ export function createGit(run: GitRunner, cwd: string) {
 		// An absolute path is refused even when it points inside the folder, so one rule covers every caller.
 		if (path.isAbsolute(file) || path.win32.isAbsolute(file)) fail();
 		const root = realLocation(path.resolve(cwd));
-		const relative = path.relative(root, realLocation(path.resolve(cwd, file)));
+		const relative = path.relative(root, physicalLocation(root, file));
 		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) fail();
 	}
 

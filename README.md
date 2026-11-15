@@ -16,7 +16,7 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 
 ## Features
 
-- **Git view**: backup status, Sync now and pending changes (stage, unstage, diff, commit). Click "Backed up …" to open Git History. The change viewer only reads inside the learning-data folder: a path that leaves it, including through a symlink, shows an error instead of a diff.
+- **Git view**: backup status, Sync now and pending changes (stage, unstage, diff, commit). Click "Backed up …" to open Git History. The change viewer takes only a relative path and follows it through the real filesystem from the learning-data folder: an absolute path, or one that leaves the folder through `..` or a symlink, shows an error instead of a diff.
 
 <p align="center">
 <img src="docs/images/git-view.png" alt="The Git view: backup status with Sync now, three pending changes and a commit box" width="760">
@@ -29,7 +29,7 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 </p>
 
 - **Automatic sync**: commit, pull and push every N minutes; pull on startup.
-- **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history. A URL that carries a password or a token, in plain or percent-encoded form anywhere in it, is refused with a reminder to use SSH keys or a credential helper.
+- **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history. A URL is refused, with a reminder to use SSH keys or a credential helper, when it carries a password, when its user name or a query or fragment parameter names a credential (`token`, `password`, `pwd`, `secret`, `api-key`), or when it holds a known token prefix such as `ghp_`, `github_pat_` or `glpat_` — plain or percent-encoded. This check is a heuristic: a token with none of those markers is not recognised, so keep credentials out of the URL yourself.
 - **Second computer**: clone an existing backup; replaced local files go to `.learnharness-git-backup/`.
 - **Clean clone failure**: a clone that cannot write every file fails instead of reporting success, keeps or restores what was there, and can be retried.
 - **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff). A session you deleted in the app is not brought back by sync, deletions survive on both sides, and you are never asked about the app's own files; the notice names what was kept.

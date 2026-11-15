@@ -226,11 +226,45 @@ describe("diff confinement", () => {
 		writeFileSync(path.join(sibling, "secret.txt"), "outside\n");
 		await fs.symlink(sibling, path.join(root, "linked"));
 		await fs.symlink(path.join(base, "secret.txt"), path.join(root, "leak.json"));
+		// A symlink that stays inside: it makes `inner/..` the data folder, not its parent.
+		await fs.symlink(path.join(root, "notes"), path.join(root, "inner"));
+		// A symlink to the folder itself, and a chain of symlinks that leaves it.
+		await fs.symlink(root, path.join(root, "rootlink"));
+		await fs.symlink(path.join(root, "linked"), path.join(root, "chain"));
 	});
 	afterEach(async () => {
 		await fs.rm(base, { recursive: true, force: true });
 	});
 
+	const escapes: [string, string][] = [
+		["a symlink then .. naming the file beside the folder", "linked/../secret.txt"],
+		[".. after a symlink to the folder itself", "rootlink/../secret.txt"],
+		["a chain of symlinks then ..", "chain/../secret.txt"],
+		["two steps back through a symlinked sibling", "linked/../data-elsewhere/../secret.txt"],
+	];
+	for (const [why, file] of escapes) {
+		test(`refuses ${why} without running git`, async () => {
+			const fake = fakeGit([]);
+			await assert.rejects(createGit(fake.run, root).diff(file, { staged: false, untracked: true }), {
+				message: outside(file),
+			});
+			assert.deepEqual(fake.calls, []);
+			fake.done();
+		});
+	}
+	test("still shows a tracked path through .. that stays inside the data folder", async () => {
+		const fake = fakeGit([
+			{
+				args: ["--literal-pathspecs", "diff", "--no-color", "--", "weird/../notes/nested.json"],
+				result: { stdout: "-{}" },
+			},
+		]);
+		assert.equal(
+			await createGit(fake.run, root).diff("weird/../notes/nested.json", { staged: false, untracked: false }),
+			"-{}",
+		);
+		fake.done();
+	});
 	test("refuses an absolute path outside the data folder without running git", async () => {
 		const fake = fakeGit([]);
 		const file = path.join(sibling, "secret.txt");
@@ -263,6 +297,24 @@ describe("diff confinement", () => {
 		await assert.rejects(createGit(fake.run, root).diff(file, { staged: false, untracked: true }), {
 			message: outside(file),
 		});
+		assert.deepEqual(fake.calls, []);
+		fake.done();
+	});
+	test("refuses a path leaving the data folder through a symlink followed by ..", async () => {
+		const fake = fakeGit([]);
+		const file = "linked/../data-elsewhere/secret.txt";
+		await assert.rejects(createGit(fake.run, root).diff(file, { staged: false, untracked: true }), {
+			message: outside(file),
+		});
+		assert.deepEqual(fake.calls, []);
+		fake.done();
+	});
+	test("refuses a symlink-plus-.. path on the tracked branch too", async () => {
+		const fake = fakeGit([]);
+		const file = "linked/../data-elsewhere/secret.txt";
+		const git = createGit(fake.run, root);
+		await assert.rejects(git.diff(file, { staged: false, untracked: false }), { message: outside(file) });
+		await assert.rejects(git.diff(file, { staged: true, untracked: false }), { message: outside(file) });
 		assert.deepEqual(fake.calls, []);
 		fake.done();
 	});
@@ -315,6 +367,41 @@ describe("diff confinement", () => {
 			},
 		]);
 		assert.equal(await createGit(fake.run, root).diff("weird/a[1].json", { staged: false, untracked: true }), "+{}");
+		fake.done();
+	});
+	test("still shows a path whose .. stays inside the data folder", async () => {
+		const fake = fakeGit([
+			{
+				args: [
+					"--literal-pathspecs",
+					"diff",
+					"--no-color",
+					"--no-index",
+					"--",
+					"/dev/null",
+					"notes/../weird/a[1].json",
+				],
+				result: { code: 1, stdout: "+{}" },
+			},
+		]);
+		assert.equal(
+			await createGit(fake.run, root).diff("notes/../weird/a[1].json", { staged: false, untracked: true }),
+			"+{}",
+		);
+		fake.done();
+	});
+	test("still shows a path through a symlink that stays inside the data folder", async () => {
+		const fake = fakeGit([
+			{ args: ["--literal-pathspecs", "diff", "--no-color", "--", "inner/nested.json"], result: { stdout: "WT" } },
+		]);
+		assert.equal(await createGit(fake.run, root).diff("inner/nested.json", { staged: false, untracked: false }), "WT");
+		fake.done();
+	});
+	test("still shows a tracked path git reports as deleted", async () => {
+		const fake = fakeGit([
+			{ args: ["--literal-pathspecs", "diff", "--no-color", "--", "gone/removed.json"], result: { stdout: "-{}" } },
+		]);
+		assert.equal(await createGit(fake.run, root).diff("gone/removed.json", { staged: false, untracked: false }), "-{}");
 		fake.done();
 	});
 });
