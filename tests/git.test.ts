@@ -887,7 +887,7 @@ describe("pull", () => {
 			[["pull", "--no-rebase", "--no-edit"]],
 		);
 	});
-	test("S1 repairs only the paths whose local lines were pruned, keeping both sides' additions", async () => {
+	test("S1 repairs only the ledgers a deletion touched, keeping both sides' additions", async () => {
 		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
 		try {
 			const pruned = "graph/nodes.jsonl";
@@ -905,7 +905,7 @@ describe("pull", () => {
 			assert.equal(await fs.readFile(path.join(tmp, added), "utf8"), '"e1"\n"local"\n"remote"\n');
 			assert.deepEqual(
 				sequence(git).filter((call) => call.startsWith("show @{upstream}")),
-				[`show @{upstream}:${pruned}`],
+				[`show @{upstream}:${pruned}`, `show @{upstream}:${added}`],
 			);
 		} finally {
 			await fs.rm(tmp, { recursive: true, force: true });
@@ -1020,6 +1020,29 @@ describe("pull", () => {
 			);
 			// The discarded upstream version is kept, so nothing the remote wrote is lost.
 			assert.equal(await fs.readFile(path.join(tmp, BACKUP, file), "utf8"), upstream);
+			// The repair dropped B, which this computer still had, so the local version is kept too.
+			assert.equal(await fs.readFile(path.join(tmp, `${BACKUP}/${file}.local`), "utf8"), head);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a record the upstream deleted stays deleted when this computer only added", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const head = '{"id":"A"}\n{"id":"B"}\n{"id":"local"}\n';
+			const upstream = '{"id":"A"}\n{"id":"F"}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head);
+			const git = incoming({
+				base: { [file]: '{"id":"A"}\n{"id":"B"}\n' },
+				head: { [file]: head },
+				upstream: { [file]: upstream },
+			});
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), '{"id":"A"}\n{"id":"local"}\n{"id":"F"}\n');
+			assert.equal(await fs.readFile(path.join(tmp, BACKUP, file), "utf8"), upstream);
+			assert.equal(await fs.readFile(path.join(tmp, `${BACKUP}/${file}.local`), "utf8"), head);
 		} finally {
 			await fs.rm(tmp, { recursive: true, force: true });
 		}

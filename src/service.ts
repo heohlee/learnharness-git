@@ -55,7 +55,7 @@ function paths(input: unknown): string[] {
 }
 
 /** Prefixes that GitHub, GitLab and similar use for access tokens pasted in place of a user name. */
-const TOKEN_PREFIX = /^(?:gh[pousr]_|github_pat_|glpat_)/i;
+const TOKEN_PREFIX = /^(?:gh[pousr]_|github_pat_|glpat[-_])/i;
 
 /** Words that name a credential in a user name or in a query or fragment parameter. */
 const CREDENTIAL_NAME = /token|passw|pwd|secret|api[_-]?key/i;

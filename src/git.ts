@@ -352,8 +352,8 @@ export function createGit(run: GitRunner, cwd: string) {
 		return result.code === 0 ? result.stdout : null;
 	}
 	/**
-	 * Paths the incoming merge must repair instead of letting a line union undo a removal here: a graph ledger this
-	 * computer removed lines from, or a chat it deleted, that the upstream also changed. Every other path keeps the
+	 * Paths the incoming merge must repair instead of letting a line union undo a removal: a graph ledger either side
+	 * removed lines from, or a chat this computer deleted, that both sides changed. Every other path keeps the
 	 * ordinary pull, and unrelated histories have no base to compare with.
 	 */
 	async function deletionRepairs(): Promise<Repair[]> {
@@ -367,9 +367,11 @@ export function createGit(run: GitRunner, cwd: string) {
 				const original = await contentAt(base, file);
 				const kept = await contentAt("HEAD", file);
 				if (original === null || kept === null) continue;
-				const removed = new Set(ledgerLines(kept));
-				if (!ledgerLines(original).some((line) => !removed.has(line))) continue;
-				const repair = { path: file, base: original, local: kept, remote: await contentAt("@{upstream}", file) };
+				const remote = await contentAt("@{upstream}", file);
+				const here = new Set(ledgerLines(kept));
+				const there = new Set(ledgerLines(remote ?? ""));
+				if (!ledgerLines(original).some((line) => !here.has(line) || !there.has(line))) continue;
+				const repair = { path: file, base: original, local: kept, remote };
 				// A ledger the committed side already settled needs no rewrite, so git keeps any uncommitted edit.
 				if (deletionDecision(repair) !== null) repairs.push(repair);
 			} else if (isChatFile(file) && (await contentAt("HEAD", file)) === null) {

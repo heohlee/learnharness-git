@@ -419,6 +419,7 @@ describe("remote", () => {
 		["a token in a query value", "https://github.com/me/data.git?auth=ghp_abc123"],
 		["a token in the fragment", "https://github.com/me/data.git#access_token=abc"],
 		["a GitLab token as the user name", "https://glpat_abcdef123456@github.com/me/data.git"],
+		["a hyphenated GitLab token as the user name", "https://glpat-Abcdef0123456789abcde@host/x"],
 		["a password parameter", "https://github.com/me/data.git?password=abc123"],
 		["a percent-encoded token name in the fragment", "https://github.com/me/data.git#%74oken=abc"],
 		["a percent-encoded token value in the query", "https://github.com/me/data.git?auth=%67hp_abc123"],

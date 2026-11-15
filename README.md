@@ -29,9 +29,9 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 </p>
 
 - **Automatic sync**: commit, pull and push every N minutes; pull on startup.
-- **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history. A URL is refused, with a reminder to use SSH keys or a credential helper, when it carries a password, when its user name or a query or fragment parameter names a credential (`token`, `password`, `pwd`, `secret`, `api-key`), or when it holds a known token prefix such as `ghp_`, `github_pat_` or `glpat_` — plain or percent-encoded. This check is a heuristic: a token with none of those markers is not recognised, so keep credentials out of the URL yourself.
+- **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history. A URL is refused, with a reminder to use SSH keys or a credential helper, when it carries a password, when its user name or a query or fragment parameter names a credential (`token`, `password`, `pwd`, `secret`, `api-key`), or when it holds a known token prefix such as `ghp_`, `github_pat_`, `glpat-` or `glpat_` — plain or percent-encoded. This check is a heuristic: a token with none of those markers is not recognised, so keep credentials out of the URL yourself.
 - **Second computer**: clone an existing backup; replaced local files go to `.learnharness-git-backup/`.
-- **Clean clone failure**: a clone that cannot write every file fails instead of reporting success, keeps or restores what was there, and can be retried.
+- **Clean clone failure**: a clone that cannot write every file fails instead of reporting success, removes only the files it wrote itself, keeps or restores what was already there, and can be retried.
 - **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff). A session you deleted in the app is not brought back by sync, deletions survive on both sides, and you are never asked about the app's own files; the notice names what was kept.
 - **Valid JSON only**: invalid JSON is never committed.
 - **Safe with your Git work**: never touches a merge, rebase, cherry-pick or revert you started.
@@ -107,8 +107,9 @@ while the remote's new records are kept, and a session the app deleted here stay
 it: sync applies this itself, so no user choice is required. A discarded remote version is saved first under
 `.learnharness-git-backup/`, which stays out of the repository. Because the files are read directly, an existing
 `graph/*.jsonl merge=union` attribute cannot hide a deletion, and the plugin never changes your `.gitattributes`. The
-same rule runs the other way: a deletion made on the other computer also stays deleted here, with the local copy kept
-under `.learnharness-git-backup/`. A deletion the remote did not touch, and ledgers both sides only added to, merge as
+same rule runs the other way: a deletion made on the other computer also stays deleted here, even when this
+computer only added records; the version it replaced is kept as `<file>.local` next to the upstream one under
+`.learnharness-git-backup/`. A deletion the remote did not touch, and ledgers both sides only added to, merge as
 before. If the file sync must rewrite already has uncommitted changes, sync stops and names it instead of overwriting
 your edit: commit or discard it, then pull again.
 

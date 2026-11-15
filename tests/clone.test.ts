@@ -436,6 +436,78 @@ describe("clone rollback", () => {
 	});
 });
 
+describe("clone rollback of a repository that was already here", () => {
+	const INCOMPLETE = (file: string) => `Clone incomplete: git did not write ${file} from the remote. Retry the clone.`;
+	const HEAD_TRUNK = "ref: refs/heads/trunk\n";
+	// What real git writes for an initialized but unborn repository, and the remote section `remote add` appends.
+	const CONFIG =
+		"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n";
+	const ORIGIN = `[remote "origin"]\n\turl = ${URL}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n`;
+	const there = async (rel: string) => (await fs.stat(path.join(dir, rel)).catch(() => null)) !== null;
+
+	test("a failed verification undoes the branch, index, remote and HEAD the attempt added", async () => {
+		await write(".git/HEAD", HEAD_TRUNK);
+		await write(".git/config", CONFIG);
+		const { fake, git } = scripted(
+			[
+				...remoteSetup("main", ["graph/nodes.jsonl"]),
+				{ args: checkout("main") },
+				{ args: VERIFY, result: { stdout: "graph/nodes.jsonl\0" } },
+				{ args: ["update-ref", "-d", "refs/heads/main"] },
+				{ args: ["remote", "remove", "origin"] },
+			],
+			{
+				[ADD.join(" ")]: () => write(".git/config", `${CONFIG}${ORIGIN}`),
+				// A checkout that reports success creates the branch, fills the index and moves HEAD, as real git does.
+				[checkout("main").join(" ")]: async () => {
+					await write(".git/refs/heads/main", "0123abcd\n");
+					await write(".git/index", "DIRC");
+					await write(".git/HEAD", "ref: refs/heads/main\n");
+				},
+				"update-ref -d refs/heads/main": () => fs.rm(path.join(dir, ".git/refs/heads/main")),
+				"remote remove origin": () => write(".git/config", CONFIG),
+			},
+		);
+		await assert.rejects(git.clone(URL, NOW), { message: INCOMPLETE("graph/nodes.jsonl") });
+		fake.done();
+		// A leftover branch or index stops a retry, and a moved HEAD sends it to a branch that is gone.
+		assert.deepEqual(await Promise.all([".git/refs/heads/main", ".git/index"].map(there)), [false, false]);
+		assert.equal(await fs.readFile(path.join(dir, ".git/HEAD"), "utf8"), HEAD_TRUNK);
+		assert.equal(await fs.readFile(path.join(dir, ".git/config"), "utf8"), CONFIG);
+	});
+	test("nothing the attempt did not add is undone", async () => {
+		await write(".git/HEAD", HEAD_TRUNK);
+		await write(".git/config", `${CONFIG}${ORIGIN}`);
+		await write(".git/refs/heads/main", "feedf00d\n");
+		const { fake, git } = scripted([
+			{ args: INIT },
+			{ args: ADD, result: { code: 128, stderr: "error: remote origin already exists.\n" } },
+		]);
+		await assert.rejects(git.clone(URL, NOW), { message: "git remote failed: error: remote origin already exists." });
+		fake.done();
+		assert.equal(await fs.readFile(path.join(dir, ".git/config"), "utf8"), `${CONFIG}${ORIGIN}`);
+		assert.equal(await there(".git/refs/heads/main"), true);
+	});
+	test("a file another process wrote during the clone survives a failed checkout", async () => {
+		const { fake, git } = scripted(
+			[
+				...remoteSetup("main", ["graph/nodes.jsonl", "notes.md"]),
+				{ args: checkout("main") },
+				{ args: VERIFY, result: { stdout: "notes.md\0" } },
+			],
+			{
+				// Another process writes into the folder while git is fetching.
+				[FETCH.join(" ")]: () => write("graph/draft.jsonl", "another process"),
+				[checkout("main").join(" ")]: () => write("graph/nodes.jsonl", '{"id":1}\n'),
+			},
+		);
+		await assert.rejects(git.clone(URL, NOW), { message: INCOMPLETE("notes.md") });
+		fake.done();
+		// The remote does not track that path, so this attempt never wrote it.
+		assert.deepEqual(await fs.readdir(path.join(dir, "graph")), ["draft.jsonl"]);
+	});
+});
+
 describe("clone rollback durability (S2)", () => {
 	const INCOMPLETE = (files: string) =>
 		`Clone incomplete: git did not write ${files} from the remote. Retry the clone.`;
