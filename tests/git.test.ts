@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { AuthError, ConflictError, createGit, GitError } from "../src/git.ts";
+import { AuthError, ConflictError, createGit, GitError, type GitRunner } from "../src/git.ts";
 import { fakeGit } from "./fake-git.ts";
 
 const dir = "/data";
@@ -284,8 +285,621 @@ describe("commit", () => {
 
 const clean = (branchLine: string) => ({ args: STATUS, result: { stdout: `## ${branchLine}\0` } });
 const HEAD = ["rev-parse", "-q", "--verify", "HEAD"];
+const MERGE_BASE = ["merge-base", "HEAD", "@{upstream}"];
+const FETCH = ["fetch"];
+const MERGE_UPSTREAM = ["merge", "--no-ff", "--no-commit", "@{upstream}"];
+const COMMIT_MERGE = ["commit", "--no-edit", "-q"];
+const LIT = "--literal-pathspecs";
+const NOW = new Date(2026, 10, 12, 22, 40, 5);
+const BACKUP = ".learnharness-git-backup/conflicts/2026-11-12_22-40-05";
+const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+const graph = (content: string | null) => ({ "graph/nodes.jsonl": content });
+
+/** Changed paths between two revisions, as git reports them for these contents. */
+function differing(from: Record<string, string | null>, to: Record<string, string | null>): string[] {
+	return [...new Set([...Object.keys(from), ...Object.keys(to)])].filter((file) => from[file] !== to[file]);
+}
+
+/**
+ * Fake git for a pull whose branches diverged: `base`, `head` and `upstream` hold each revision's files, and
+ * null means that revision deleted the file, so the changed paths are the ones whose content differs. Every
+ * other command succeeds with no output, and a command the pull does not need fails the test.
+ */
+function diverged(
+	versions: {
+		base?: Record<string, string | null>;
+		head?: Record<string, string | null>;
+		upstream?: Record<string, string | null>;
+	},
+	options: { branchLine?: string; mergeBase?: boolean } = {},
+) {
+	const revisions: Record<string, Record<string, string | null>> = {
+		base: versions.base ?? {},
+		HEAD: versions.head ?? {},
+		"@{upstream}": versions.upstream ?? {},
+	};
+	const calls: string[][] = [];
+	const run: GitRunner = async (args) => {
+		calls.push([...args]);
+		const key = args.join(" ");
+		if (key === STATUS.join(" ")) return ok(`## ${options.branchLine ?? "main...origin/main [ahead 1, behind 1]"}\0`);
+		if (key === FETCH.join(" ")) return ok();
+		if (key === HEAD.join(" ")) return ok(calls.some((call) => call[0] === "pull") ? "merged\n" : "local\n");
+		if (key.startsWith("rev-parse -q --verify ")) return { code: 1, stdout: "", stderr: "" };
+		if (key === REBASE_DIRS.join(" ")) return ok("/nonexistent/rebase-merge\n/nonexistent/rebase-apply\n");
+		if (key === UNMERGED.join(" ")) return ok();
+		if (key === MERGE_BASE.join(" ")) {
+			return options.mergeBase === false ? { code: 1, stdout: "", stderr: "" } : ok("base\n");
+		}
+		if (args[0] === "diff" && args[1] === "--name-only") {
+			const [from, to] = [args.at(-2) ?? "", args.at(-1) ?? ""];
+			return ok(
+				differing(revisions[from] ?? {}, revisions[to] ?? {})
+					.map((file) => `${file}\0`)
+					.join(""),
+			);
+		}
+		if (args[0] === "show" && args[1] !== undefined) {
+			const [rev, file] = args[1].split(/:(.*)/s);
+			const text = revisions[rev ?? ""]?.[file ?? ""];
+			return text === undefined || text === null
+				? { code: 128, stdout: "", stderr: "fatal: path does not exist in the given revision" }
+				: ok(text);
+		}
+		if (key === "pull --no-rebase --no-edit") return ok();
+		return assert.fail(`unexpected git call: ${key}`);
+	};
+	return { run, calls };
+}
+
+interface Revisions {
+	base: Record<string, string | null>;
+	head: Record<string, string | null>;
+	upstream: Record<string, string | null>;
+}
+
+const ledger = (file: string) => file.startsWith("graph/") && file.endsWith(".jsonl");
+const stageEntry = (stage: number, file: string) => `100644 aaa${stage} ${stage}\t${file}\0`;
+
+/**
+ * What git leaves unmerged for these revisions: a path both sides changed stays conflicted, except a graph ledger,
+ * which the documented `merge=union` attribute merges cleanly.
+ */
+function unmergedStages(versions: Revisions): string {
+	const files = new Set([...Object.keys(versions.head), ...Object.keys(versions.upstream)]);
+	const entries: string[] = [];
+	for (const file of files) {
+		const local = versions.head[file] ?? null;
+		const remote = versions.upstream[file] ?? null;
+		if (local === remote || ledger(file) || (local === null && remote === null)) continue;
+		entries.push(stageEntry(1, file));
+		if (local !== null) entries.push(stageEntry(2, file));
+		if (remote !== null) entries.push(stageEntry(3, file));
+	}
+	return entries.join("");
+}
+
+/**
+ * Fake git for a diverged pull whose upstream changed paths this computer pruned. It applies
+ * `merge --no-ff --no-commit` to the working tree the way git does — a union merge for a ledger, a conflict for
+ * a modify/delete — and records every spawned command, so tests assert both the calls and the files left behind.
+ */
+function incoming(
+	versions: Revisions,
+	options: {
+		branchLine?: string;
+		mergeFails?: boolean;
+		commitFails?: boolean;
+		unmergedFails?: boolean;
+		/** Paths with an uncommitted working-tree change, reported by `status` as ` M <path>`. */
+		dirty?: readonly string[];
+	} = {},
+) {
+	const calls: string[][] = [];
+	let unmerged = "";
+	let mergeHead = false;
+	const pathIn = (cwd: string, file: string) => path.join(cwd, file);
+	const write = (cwd: string, file: string, text: string) => {
+		mkdirSync(path.dirname(pathIn(cwd, file)), { recursive: true });
+		writeFileSync(pathIn(cwd, file), text);
+	};
+	const lines = (text: string) => text.split("\n").filter((line, i, all) => !(line === "" && i === all.length - 1));
+	const revision = (name: string) =>
+		name === "HEAD" ? versions.head : name === "@{upstream}" ? versions.upstream : versions.base;
+	const mergeResult = (cwd: string) => {
+		for (const file of new Set([...Object.keys(versions.head), ...Object.keys(versions.upstream)])) {
+			const local = versions.head[file] ?? null;
+			const remote = versions.upstream[file] ?? null;
+			if (local !== null && remote !== null && ledger(file)) {
+				// The union attribute merges both sides line by line, bringing the pruned lines back.
+				const merged = lines(local);
+				for (const line of lines(remote)) if (!merged.includes(line)) merged.push(line);
+				write(cwd, file, merged.length ? `${merged.join("\n")}\n` : "");
+			} else if (remote !== null) write(cwd, file, remote);
+		}
+	};
+	const run: GitRunner = async (args, { cwd }) => {
+		calls.push([...args]);
+		const key = args.join(" ");
+		if (key === STATUS.join(" ")) {
+			const dirty = (options.dirty ?? []).map((file) => ` M ${file}\0`).join("");
+			return ok(`## ${options.branchLine ?? "main...origin/main [ahead 1, behind 1]"}\0${dirty}`);
+		}
+		if (key === FETCH.join(" ")) return ok();
+		if (key === HEAD.join(" ")) return ok(calls.some((call) => call[0] === "pull") ? "merged\n" : "local\n");
+		if (key === MERGING.join(" ")) return mergeHead ? ok("merged\n") : { code: 1, stdout: "", stderr: "" };
+		if (key.startsWith("rev-parse -q --verify ")) return { code: 1, stdout: "", stderr: "" };
+		if (key === REBASE_DIRS.join(" ")) return ok("/nonexistent/rebase-merge\n/nonexistent/rebase-apply\n");
+		if (key === UNMERGED.join(" ")) {
+			if (options.unmergedFails === true && mergeHead) return { code: 128, stdout: "", stderr: "fatal: index locked" };
+			return ok(unmerged);
+		}
+		if (key === MERGE_BASE.join(" ")) return ok("base\n");
+		if (args[0] === "diff" && args[1] === "--name-only") {
+			const changed = differing(revision(args.at(-2) ?? ""), revision(args.at(-1) ?? ""));
+			return ok(changed.map((file) => `${file}\0`).join(""));
+		}
+		if (args[0] === "show") {
+			const [name, file] = (args[1] ?? "").split(/:(.*)/s);
+			const text = revision(name ?? "")[file ?? ""] ?? null;
+			return text === null
+				? { code: 128, stdout: "", stderr: "fatal: path does not exist in the given revision" }
+				: ok(text);
+		}
+		if (key === MERGE_UPSTREAM.join(" ")) {
+			if (options.mergeFails === true) return { code: 128, stdout: "", stderr: "fatal: cannot merge" };
+			mergeResult(cwd);
+			unmerged = unmergedStages(versions);
+			mergeHead = true;
+			return { code: unmerged ? 1 : 0, stdout: "Auto-merging\n", stderr: "" };
+		}
+		if (key === "merge --abort") {
+			for (const [file, text] of Object.entries(versions.head)) {
+				if (text === null) rmSync(pathIn(cwd, file), { force: true });
+				else write(cwd, file, text);
+			}
+			unmerged = "";
+			mergeHead = false;
+			return ok();
+		}
+		if (args[0] === LIT && args[1] === "add") return ok();
+		if (args[0] === LIT && args[1] === "rm") {
+			rmSync(pathIn(cwd, args.at(-1) ?? ""), { force: true });
+			return ok();
+		}
+		if (key === COMMIT_MERGE.join(" ")) {
+			if (options.commitFails === true) return { code: 1, stdout: "", stderr: "fatal: cannot commit" };
+			unmerged = "";
+			mergeHead = false;
+			return ok();
+		}
+		// An ordinary pull: the merge changes nothing in the working tree, so an uncommitted edit stays.
+		if (key === "pull --no-rebase --no-edit") return ok("Merge made by the 'ort' strategy.\n");
+		return assert.fail(`unexpected git call: ${key}`);
+	};
+	return { run, calls };
+}
+
+const sequence = (git: { calls: string[][] }) => git.calls.map((call) => call.join(" "));
 
 describe("pull", () => {
+	test("S1 an incoming ledger change does not resurrect the records this computer removed", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const base = '{"id":1}\n{"id":2}\n';
+			const head = '{"id":2}\n';
+			const upstream = '{"id":1}\n{"id":2}\n{"id":3}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head);
+			const git = incoming({ base: { [file]: base }, head: { [file]: head }, upstream: { [file]: upstream } });
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			// The record this computer deleted stays gone, the remote's new record is kept, in one merge commit.
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), '{"id":2}\n{"id":3}\n');
+			assert.deepEqual(sequence(git), [
+				"status --porcelain=v1 --branch -z -uall",
+				"rev-parse -q --verify MERGE_HEAD",
+				"rev-parse -q --verify CHERRY_PICK_HEAD",
+				"rev-parse -q --verify REVERT_HEAD",
+				"rev-parse --git-path rebase-merge --git-path rebase-apply",
+				"ls-files -u -z",
+				"rev-parse -q --verify HEAD",
+				"fetch",
+				"status --porcelain=v1 --branch -z -uall",
+				"merge-base HEAD @{upstream}",
+				"diff --name-only -z base HEAD",
+				"diff --name-only -z base @{upstream}",
+				`show base:${file}`,
+				`show HEAD:${file}`,
+				`show @{upstream}:${file}`,
+				"merge --no-ff --no-commit @{upstream}",
+				"ls-files -u -z",
+				`--literal-pathspecs add -- ${file}`,
+				"commit --no-edit -q",
+			]);
+			// The upstream version this repair replaced is kept aside, outside the repository.
+			assert.equal(await fs.readFile(path.join(tmp, BACKUP, file), "utf8"), upstream);
+			assert.equal(await fs.readFile(path.join(tmp, ".git", "info", "exclude"), "utf8"), ".learnharness-git-backup/\n");
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a chat this computer deleted stays deleted when the remote edited it", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "chats/linear-algebra.json";
+			const base = '{"updatedAt":"2026-11-11T21:00:00.000Z","messages":[]}';
+			const upstream = '{"updatedAt":"2026-11-12T21:00:00.000Z","messages":["remote"]}';
+			const git = incoming({ base: { [file]: base }, head: {}, upstream: { [file]: upstream } });
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			assert.equal(await fs.stat(path.join(tmp, file)).catch(() => null), null);
+			assert.equal(await fs.readFile(path.join(tmp, BACKUP, file), "utf8"), upstream);
+			const spawned = sequence(git);
+			assert.deepEqual(spawned.slice(-5), [
+				"merge --no-ff --no-commit @{upstream}",
+				"rev-parse -q --verify MERGE_HEAD",
+				"ls-files -u -z",
+				`--literal-pathspecs rm -q -- ${file}`,
+				"commit --no-edit -q",
+			]);
+			assert.equal(
+				spawned.some((call) => call.startsWith("pull") || call.startsWith("push")),
+				false,
+			);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a repair that cannot complete aborts the merge, leaves the files alone and commits nothing", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const notes = "notes.md";
+			const head = { [file]: '{"id":2}\n', [notes]: "local notes\n" };
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head[file]);
+			await fs.writeFile(path.join(tmp, notes), head[notes]);
+			const git = incoming({
+				base: { [file]: '{"id":1}\n{"id":2}\n', [notes]: "base notes\n" },
+				head,
+				upstream: { [file]: '{"id":1}\n{"id":2}\n{"id":3}\n', [notes]: "remote notes\n" },
+			});
+			const result = await createGit(git.run, tmp)
+				.pull({ mode: "auto", now: NOW })
+				.catch((error: unknown) => error);
+			assert.ok(result instanceof ConflictError);
+			assert.equal(result.message, "Merge conflict with origin/main. Pull aborted; no files changed.");
+			assert.deepEqual(result.files, [notes]);
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), head[file]);
+			assert.equal(await fs.readFile(path.join(tmp, notes), "utf8"), head[notes]);
+			const spawned = sequence(git);
+			assert.equal(spawned.includes("merge --abort"), true);
+			assert.equal(
+				spawned.some((call) => call.startsWith("commit") || call.startsWith("pull") || call.startsWith("push")),
+				false,
+			);
+			assert.equal(await fs.stat(path.join(tmp, ".learnharness-git-backup")).catch(() => null), null);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a merge that cannot start reports git's error and changes nothing", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const head = '{"id":2}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head);
+			const git = incoming(
+				{
+					base: { [file]: '{"id":1}\n{"id":2}\n' },
+					head: { [file]: head },
+					upstream: { [file]: '{"id":1}\n{"id":2}\n{"id":3}\n' },
+				},
+				{ mergeFails: true },
+			);
+			await assert.rejects(createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), {
+				name: "GitError",
+				message: "git merge failed: fatal: cannot merge",
+			});
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), head);
+			assert.equal(
+				sequence(git).some((call) => call.startsWith("commit") || call.startsWith("pull")),
+				false,
+			);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a repair whose commit fails aborts the merge and reports git's error", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const head = '{"id":2}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head);
+			const git = incoming(
+				{
+					base: { [file]: '{"id":1}\n{"id":2}\n' },
+					head: { [file]: head },
+					upstream: { [file]: '{"id":1}\n{"id":2}\n{"id":3}\n' },
+				},
+				{ commitFails: true },
+			);
+			await assert.rejects(createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), {
+				name: "GitError",
+				message: "git commit failed: fatal: cannot commit",
+			});
+			// The merge is aborted: the ledger is back to what this computer had and no commit was made.
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), head);
+			const spawned = sequence(git);
+			assert.deepEqual(spawned.slice(-2), ["commit --no-edit -q", "merge --abort"]);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a repair that cannot read the merge state aborts it and reports git's error", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const head = '{"id":2}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head);
+			const git = incoming(
+				{
+					base: { [file]: '{"id":1}\n{"id":2}\n' },
+					head: { [file]: head },
+					upstream: { [file]: '{"id":1}\n{"id":2}\n{"id":3}\n' },
+				},
+				{ unmergedFails: true },
+			);
+			await assert.rejects(createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), {
+				name: "GitError",
+				message: "git ls-files failed: fatal: index locked",
+			});
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), head);
+			assert.equal(sequence(git).at(-1), "merge --abort");
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("a graph deletion the remote did not touch pulls normally", async () => {
+		const git = diverged({ base: graph('"a"\n"b"\n'), head: graph('"a"\n'), upstream: graph('"a"\n"b"\n') });
+		assert.equal(await createGit(git.run, dir).pull(), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => ["pull", "merge", "commit", "push"].includes(call[0] ?? "")),
+			[["pull", "--no-rebase", "--no-edit"]],
+		);
+	});
+	test("a ledger both sides only added to pulls normally", async () => {
+		const git = diverged({ base: graph('"a"\n'), head: graph('"a"\n"local"\n'), upstream: graph('"a"\n"remote"\n') });
+		assert.equal(await createGit(git.run, dir).pull(), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => ["pull", "merge", "commit", "push"].includes(call[0] ?? "")),
+			[["pull", "--no-rebase", "--no-edit"]],
+		);
+	});
+	test("S1 a whole ledger file deleted here and edited upstream keeps the ordinary pull", async () => {
+		const git = diverged({ base: graph('"a"\n'), head: {}, upstream: graph('"a"\n"edited"\n') });
+		assert.equal(await createGit(git.run, dir).pull({ mode: "auto" }), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => ["pull", "merge", "commit", "push"].includes(call[0] ?? "")),
+			[["pull", "--no-rebase", "--no-edit"]],
+		);
+	});
+	test("S1 repairs only the paths whose local lines were pruned, keeping both sides' additions", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const pruned = "graph/nodes.jsonl";
+			const added = "graph/edges.jsonl";
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, pruned), '"n2"\n');
+			await fs.writeFile(path.join(tmp, added), '"e1"\n"local"\n');
+			const git = incoming({
+				base: { [pruned]: '"n1"\n"n2"\n', [added]: '"e1"\n' },
+				head: { [pruned]: '"n2"\n', [added]: '"e1"\n"local"\n' },
+				upstream: { [pruned]: '"n1"\n"n2"\n"n3"\n', [added]: '"e1"\n"remote"\n' },
+			});
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			assert.equal(await fs.readFile(path.join(tmp, pruned), "utf8"), '"n2"\n"n3"\n');
+			assert.equal(await fs.readFile(path.join(tmp, added), "utf8"), '"e1"\n"local"\n"remote"\n');
+			assert.deepEqual(
+				sequence(git).filter((call) => call.startsWith("show @{upstream}")),
+				[`show @{upstream}:${pruned}`],
+			);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("a path outside the ledgers and chats keeps the ordinary pull", async () => {
+		const git = diverged({
+			base: { "notes.md": "base\n" },
+			head: { "notes.md": "local\n" },
+			upstream: { "notes.md": "remote\n" },
+		});
+		assert.equal(await createGit(git.run, dir).pull({ mode: "auto" }), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => call[0] === "show" || call[0] === "merge"),
+			[],
+		);
+	});
+	test("a chat untouched here and edited upstream pulls normally", async () => {
+		const file = "chats/a.json";
+		const base = '{"updatedAt":"2026-11-11T21:00:00.000Z"}';
+		const git = diverged({
+			base: { [file]: base },
+			head: { [file]: base },
+			upstream: { [file]: '{"updatedAt":"2026-11-12T21:00:00.000Z"}' },
+		});
+		assert.equal(await createGit(git.run, dir).pull({ mode: "auto" }), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => ["pull", "merge", "commit", "push"].includes(call[0] ?? "")),
+			[["pull", "--no-rebase", "--no-edit"]],
+		);
+	});
+	test("local additions only pull normally", async () => {
+		const git = diverged({
+			base: graph('"a"\n'),
+			head: graph('"a"\n"local"\n'),
+			upstream: graph('"a"\n'),
+		});
+		assert.equal(await createGit(git.run, dir).pull({ mode: "auto" }), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => ["pull", "merge", "commit", "push"].includes(call[0] ?? "")),
+			[["pull", "--no-rebase", "--no-edit"]],
+		);
+	});
+	test("unrelated histories keep the ordinary pull", async () => {
+		const git = diverged({ base: graph('"a"\n'), head: {}, upstream: graph('"a"\n"edited"\n') }, { mergeBase: false });
+		assert.equal(await createGit(git.run, dir).pull(), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => call[0] === "show"),
+			[],
+		);
+	});
+	test("a fast-forward is not inspected before pulling", async () => {
+		const git = diverged(
+			{ base: graph('"a"\n'), head: {}, upstream: graph('"a"\n"edited"\n') },
+			{ branchLine: "main...origin/main [behind 2]" },
+		);
+		assert.equal(await createGit(git.run, dir).pull(), "pulled");
+		assert.deepEqual(
+			git.calls.filter((call) => call[0] === "merge-base" || call[0] === "show"),
+			[],
+		);
+	});
+	test("S1 the documented merge=union attribute does not bring a deleted record back", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const attributes = "graph/*.jsonl merge=union\n";
+			const file = "graph/nodes.jsonl";
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, ".gitattributes"), attributes);
+			await fs.writeFile(path.join(tmp, file), '"b"\n');
+			const git = incoming({
+				base: { [file]: '"a"\n"b"\n' },
+				head: { [file]: '"b"\n' },
+				upstream: { [file]: '"a"\n"b"\n"c"\n' },
+			});
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), '"b"\n"c"\n');
+			// The plugin reads the ledgers itself and never rewrites the attribute file.
+			assert.equal(await fs.readFile(path.join(tmp, ".gitattributes"), "utf8"), attributes);
+			assert.deepEqual(
+				sequence(git).filter((call) => call.includes("check-attr") || call.includes("config")),
+				[],
+			);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a record the upstream deleted stays deleted next to the one this computer deleted", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const base = '{"id":"A"}\n{"id":"B"}\n{"id":"C"}\n{"id":"D"}\n{"id":"E"}\n';
+			// This computer deleted C; the upstream deleted B and added F.
+			const head = '{"id":"A"}\n{"id":"B"}\n{"id":"D"}\n{"id":"E"}\n';
+			const upstream = '{"id":"A"}\n{"id":"C"}\n{"id":"D"}\n{"id":"E"}\n{"id":"F"}\n';
+			const merged = '{"id":"A"}\n{"id":"D"}\n{"id":"E"}\n{"id":"F"}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), head);
+			const git = incoming({ base: { [file]: base }, head: { [file]: head }, upstream: { [file]: upstream } });
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			// Neither deletion is undone and the upstream's new record is kept.
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), merged);
+			const spawned = sequence(git);
+			assert.deepEqual(
+				spawned.filter((call) => call.startsWith("commit")),
+				["commit --no-edit -q"],
+			);
+			// The union attribute would have brought B and C back, so the repair never runs a pull.
+			assert.equal(
+				spawned.some((call) => call.startsWith("pull")),
+				false,
+			);
+			// The discarded upstream version is kept, so nothing the remote wrote is lost.
+			assert.equal(await fs.readFile(path.join(tmp, BACKUP, file), "utf8"), upstream);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a repair that would overwrite an uncommitted ledger edit refuses before any merge", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			const head = '{"id":"A"}\n{"id":"B"}\n';
+			const edited = '{"id":"A"}\n{"id":"B"}\n{"id":"draft"}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), edited);
+			const git = incoming(
+				{
+					base: { [file]: '{"id":"A"}\n{"id":"B"}\n{"id":"C"}\n' },
+					head: { [file]: head },
+					upstream: { [file]: '{"id":"A"}\n{"id":"B"}\n{"id":"C"}\n{"id":"D"}\n' },
+				},
+				{ dirty: [file] },
+			);
+			await assert.rejects(createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), {
+				name: "Error",
+				message: `Sync needs to rewrite ${file}, which has uncommitted changes. Commit or discard them, then pull again.`,
+			});
+			// The uncommitted edit is byte-identical: nothing was merged, staged, committed or pulled.
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), edited);
+			assert.deepEqual(sequence(git), [
+				"status --porcelain=v1 --branch -z -uall",
+				"rev-parse -q --verify MERGE_HEAD",
+				"rev-parse -q --verify CHERRY_PICK_HEAD",
+				"rev-parse -q --verify REVERT_HEAD",
+				"rev-parse --git-path rebase-merge --git-path rebase-apply",
+				"ls-files -u -z",
+				"rev-parse -q --verify HEAD",
+				"fetch",
+				"status --porcelain=v1 --branch -z -uall",
+				"merge-base HEAD @{upstream}",
+				"diff --name-only -z base HEAD",
+				"diff --name-only -z base @{upstream}",
+				`show base:${file}`,
+				`show HEAD:${file}`,
+				`show @{upstream}:${file}`,
+			]);
+			assert.equal(await fs.stat(path.join(tmp, ".learnharness-git-backup")).catch(() => null), null);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+	test("S1 a ledger both sides already settled keeps the ordinary pull and an uncommitted edit", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			// Both tips removed the same record, so the repair would write exactly the committed content.
+			const settled = '{"id":"A"}\n{"id":"B"}\n';
+			const edited = '{"id":"A"}\n{"id":"B"}\n{"id":"draft"}\n';
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), edited);
+			const git = incoming(
+				{
+					base: { [file]: '{"id":"A"}\n{"id":"B"}\n{"id":"C"}\n' },
+					head: { [file]: settled },
+					upstream: { [file]: settled },
+				},
+				{ dirty: [file] },
+			);
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			// No repair is needed, so git is left to pull and the uncommitted edit survives untouched.
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), edited);
+			const spawned = sequence(git);
+			assert.equal(spawned.at(-2), "pull --no-rebase --no-edit");
+			// `merge-base` is read-only; no merge, commit or staging rewrote the file.
+			assert.equal(
+				spawned.some((call) => call.startsWith("merge --no-ff") || call.startsWith("commit") || call.includes(" add ")),
+				false,
+			);
+			assert.equal(await fs.stat(path.join(tmp, ".learnharness-git-backup")).catch(() => null), null);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
 	test("skips without an upstream", async () => {
 		const fake = fakeGit([clean("main")]);
 		assert.equal(await createGit(fake.run, dir).pull(), "no-upstream");
@@ -296,6 +910,22 @@ describe("pull", () => {
 			clean("main...origin/main [behind 1]"),
 			...noMerge,
 			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: FETCH },
+			clean("main...origin/main [behind 1]"),
+			{ args: ["pull", "--no-rebase", "--no-edit"] },
+			{ args: HEAD, result: { stdout: "bbb\n" } },
+		]);
+		assert.equal(await createGit(fake.run, dir).pull(), "pulled");
+		fake.done();
+	});
+	test("fetches first so the divergence is read from the current upstream", async () => {
+		const fake = fakeGit([
+			clean("main...origin/main"),
+			...noMerge,
+			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: FETCH },
+			clean("main...origin/main [ahead 1, behind 1]"),
+			{ args: MERGE_BASE, result: { code: 1 } },
 			{ args: ["pull", "--no-rebase", "--no-edit"] },
 			{ args: HEAD, result: { stdout: "bbb\n" } },
 		]);
@@ -307,10 +937,13 @@ describe("pull", () => {
 			clean("main...origin/main"),
 			...noMerge,
 			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: FETCH },
+			clean("main...origin/main"),
 			{ args: ["pull", "--no-rebase", "--no-edit"] },
 			{ args: HEAD, result: { stdout: "aaa\n" } },
 		]);
 		assert.equal(await createGit(fake.run, dir).pull(), "up-to-date");
+		fake.done();
 	});
 	test("leaves a merge the user started untouched and pulls nothing", async () => {
 		const fake = fakeGit([clean("main...origin/main"), { args: MERGING, result: { stdout: "ccc\n" } }]);
@@ -322,6 +955,8 @@ describe("pull", () => {
 			clean("main...origin/main"),
 			...noMerge,
 			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: FETCH },
+			clean("main...origin/main"),
 			{ args: ["pull", "--no-rebase", "--no-edit"], result: { code: 1, stdout: "CONFLICT (content)" } },
 			{ args: ["rev-parse", "-q", "--verify", "MERGE_HEAD"], result: { stdout: "ccc\n" } },
 			{
@@ -344,6 +979,8 @@ describe("pull", () => {
 			clean("main...origin/main"),
 			...noMerge,
 			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: FETCH },
+			clean("main...origin/main"),
 			{
 				args: ["pull", "--no-rebase", "--no-edit"],
 				result: { code: 1, stderr: "fatal: Could not read from remote repository." },
@@ -542,6 +1179,8 @@ describe("authentication failures", () => {
 			clean("main...origin/main"),
 			...noMerge,
 			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: FETCH },
+			clean("main...origin/main"),
 			{ args: PULL, result: { code: 1, stderr } },
 			{ args: MERGING, result: { code: 1 } },
 			{ args: GET_URL, result: url },
@@ -763,6 +1402,23 @@ describe("plugins installed with git clone (nested repositories)", () => {
 		fake.done();
 		assert.equal(await read(EXCLUDE), block("learnharness-git"));
 		assert.equal((await read(".gitignore")).includes("learnharness-git"), false);
+	});
+	test("S1 a ledger the app emptied here keeps only the upstream's new records", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-s1-"));
+		try {
+			const file = "graph/nodes.jsonl";
+			await fs.mkdir(path.join(tmp, "graph"));
+			await fs.writeFile(path.join(tmp, file), "");
+			const git = incoming({
+				base: { [file]: '{"id":1}\n{"id":2}\n' },
+				head: { [file]: "" },
+				upstream: { [file]: '{"id":1}\n{"id":2}\n{"id":3}\n' },
+			});
+			assert.equal(await createGit(git.run, tmp).pull({ mode: "auto", now: NOW }), "pulled");
+			assert.equal(await fs.readFile(path.join(tmp, file), "utf8"), '{"id":3}\n');
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
 	});
 	test("status, stage and listFiles exclude them first, so they are never listed or staged", async () => {
 		await plugin("learnharness-git", "dir");

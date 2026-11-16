@@ -31,7 +31,7 @@ handles merge conflicts without ever leaving broken JSON in your learning record
 - **Automatic sync**: commit, pull and push every N minutes; pull on startup.
 - **Connect a remote**: set the URL in Settings; before the first push, flags files that may hold secrets, including in the history.
 - **Second computer**: clone an existing backup; replaced local files go to `.learnharness-git-backup/`.
-- **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff).
+- **Merge conflicts**: resolved automatically (newest wins, the other is backed up) or per file (Local / Remote, with diff). A session you deleted in the app is not brought back by sync, and you are never asked about the app's own files.
 - **Valid JSON only**: invalid JSON is never committed.
 - **Safe with your Git work**: never touches a merge, rebase, cherry-pick or revert you started.
 - **Clear auth errors**: suggests `gh auth setup-git` or an SSH URL.
@@ -99,6 +99,17 @@ npm run install:local -- "<plugins folder>"
 **Initialize repository** adds a `.gitignore` and a `.gitattributes` for the learning data if they don't exist.
 Existing ones are never changed. The `.gitattributes` makes graph ledgers changed on two computers merge
 instead of conflicting.
+
+Merging graph ledgers line by line is safe for records both sides added, but not for a record one side deleted.
+Before merging, the plugin reads the ledgers and the chats themselves. A record this computer removed stays removed
+while the remote's new records are kept, and a session the app deleted here stays deleted even if the remote edited
+it: sync applies this itself, so no user choice is required. A discarded remote version is saved first under
+`.learnharness-git-backup/`, which stays out of the repository. Because the files are read directly, an existing
+`graph/*.jsonl merge=union` attribute cannot hide a deletion, and the plugin never changes your `.gitattributes`. The
+same rule runs the other way: a deletion made on the other computer also stays deleted here, with the local copy kept
+under `.learnharness-git-backup/`. A deletion the remote did not touch, and ledgers both sides only added to, merge as
+before. If the file sync must rewrite already has uncommitted changes, sync stops and names it instead of overwriting
+your edit: commit or discard it, then pull again.
 
 <details>
 <summary>What they contain</summary>

@@ -39,9 +39,78 @@ interface Decision extends ResolvedFile {
 	remote: string | null;
 	/** Merged content written for "both". */
 	merged?: string;
+	/** Upstream content this decision replaces, saved in the backup folder before it is dropped. */
+	dropped?: string;
 }
 
 const LITERAL = "--literal-pathspecs";
+
+/** The graph ledgers the plugin merges line by line: one file per graph, graph/*.jsonl. */
+export function isGraphLedger(file: string): boolean {
+	return /^graph\/[^/]+\.jsonl$/.test(file);
+}
+
+/** The session files the app deletes outright when a chat is removed: chats/<id>.json. */
+export function isChatFile(file: string): boolean {
+	return /^chats\/[^/]+\.json$/.test(file);
+}
+
+/** The lines of a ledger, without the empty line a trailing newline leaves. */
+export function ledgerLines(text: string): string[] {
+	return text.split("\n").filter((line, i, all) => !(line === "" && i === all.length - 1));
+}
+
+/**
+ * Merges a graph ledger so a record deleted on either computer never comes back: a line base had that this side
+ * removed stays removed, a line base had that the upstream removed is dropped here too, and every line either side
+ * added is kept.
+ */
+export function deletionSafeUnion(
+	base: readonly string[],
+	local: readonly string[],
+	remote: readonly string[],
+): string {
+	const original = new Set(base);
+	const upstreamKept = new Set(remote);
+	// Deletion wins on both sides: a base line survives only when neither side removed it.
+	const merged = local.filter((line) => !original.has(line) || upstreamKept.has(line));
+	const seen = new Set(merged);
+	for (const line of remote) {
+		if (original.has(line) || seen.has(line)) continue;
+		merged.push(line);
+		seen.add(line);
+	}
+	return merged.length ? `${merged.join("\n")}\n` : "";
+}
+
+/** One path a diverged merge must repair, with its content at the three revisions; null: absent there. */
+export interface Repair {
+	path: string;
+	base: string | null;
+	local: string | null;
+	remote: string | null;
+}
+
+/**
+ * Decides one repair so the merge never undoes a removal this computer made: a ledger keeps its local lines plus
+ * the upstream ones base did not have, and a chat deleted here stays deleted. Null when the path needs no repair.
+ */
+export function deletionDecision(repair: Repair): Decision | null {
+	const { path: file, base, local, remote } = repair;
+	if (isGraphLedger(file)) {
+		if (base === null || local === null || remote === null) return null;
+		const merged = deletionSafeUnion(ledgerLines(base), ledgerLines(local), ledgerLines(remote));
+		// Nothing to repair when the committed ledger already holds the answer: git leaves the file (and any
+		// uncommitted edit to it) alone, so writing it here would only risk that edit.
+		if (merged === local) return null;
+		return { path: file, kept: "both", rule: "union merge, deletions kept", local, remote, merged, dropped: remote };
+	}
+	// Deletion wins: the app rewrites the ledgers wholesale, so a chat it removed must not come back.
+	if (isChatFile(file) && local === null && remote !== null) {
+		return { path: file, kept: "local", rule: "deletion kept", local: null, remote: null, dropped: remote };
+	}
+	return null;
+}
 
 /** Conflicted paths, in git's order, with the stages each one has (1 base, 2 local, 3 remote). */
 export function parseUnmerged(stdout: string): Map<string, Set<number>> {
@@ -59,7 +128,7 @@ export function parseUnmerged(stdout: string): Map<string, Set<number>> {
 type Rule = "session" | "commit" | "version" | "union";
 
 function ruleFor(file: string): Rule | null {
-	if (/^graph\/[^/]+\.jsonl$/.test(file)) return "union";
+	if (isGraphLedger(file)) return "union";
 	if (file === "graph/format.json") return "version";
 	if (file.startsWith("chats/") && file.endsWith(".json")) return "session";
 	if (
@@ -95,20 +164,6 @@ function time(value: unknown): number | null {
 }
 
 const number = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : null);
-
-/** Local lines, then every remote line local does not have: what git's union merge keeps. */
-function union(local: string, remote: string): string {
-	const lines = (text: string) => text.split("\n").filter((line, i, all) => !(line === "" && i === all.length - 1));
-	const out = lines(local);
-	const seen = new Set(out);
-	for (const line of lines(remote)) {
-		if (!seen.has(line)) {
-			out.push(line);
-			seen.add(line);
-		}
-	}
-	return out.length ? `${out.join("\n")}\n` : "";
-}
 
 export function createResolver(exec: Exec, cwd: string) {
 	async function sides(file: string, stages: Set<number>) {
@@ -147,6 +202,8 @@ export function createResolver(exec: Exec, cwd: string) {
 		const rule = ruleFor(file);
 		const modifyDelete = stages.has(2) !== stages.has(3);
 		if (!modifyDelete && rule === null) return null;
+		// A union merge needs the base lines to tell a deletion from an addition.
+		const base = !modifyDelete && rule === "union" && stages.has(1) ? (await exec(["show", `:1:${file}`])).stdout : "";
 		const versions = await sides(file, stages);
 		const pick = (remoteWins: boolean, why: string): Decision => ({
 			path: file,
@@ -158,10 +215,19 @@ export function createResolver(exec: Exec, cwd: string) {
 		const compare = (local: number, remote: number, why: string): Decision =>
 			pick(remote > local, local === remote ? "tie, local kept" : why);
 		let decision: Decision;
-		if (modifyDelete) decision = pick(versions.local === null, "modified kept");
-		else if (rule === "union") {
-			const merged = union(versions.local ?? "", versions.remote ?? "");
-			decision = { path: file, kept: "both", rule: "union merge", ...versions, merged };
+		if (modifyDelete) {
+			// A graph ledger or a session deleted on one side wins by deletion: an edited copy would resurrect it.
+			decision =
+				rule === "union" || rule === "session"
+					? pick(versions.local !== null, "deletion kept")
+					: pick(versions.local === null, "modified kept");
+		} else if (rule === "union") {
+			const original = ledgerLines(base);
+			const local = ledgerLines(versions.local ?? "");
+			const remote = ledgerLines(versions.remote ?? "");
+			if ([original, local, remote].some((items) => new Set(items).size !== items.length)) return null;
+			const merged = deletionSafeUnion(original, local, remote);
+			decision = { path: file, kept: "both", rule: "union merge, deletions kept", ...versions, merged };
 		} else if (rule === "session") {
 			const local = time(field(versions.local, "updatedAt"));
 			const remote = time(field(versions.remote, "updatedAt"));
@@ -212,8 +278,9 @@ export function createResolver(exec: Exec, cwd: string) {
 				const loser = d.kept === "local" ? d.remote : d.local;
 				return loser === null ? [] : [{ file: d.path, stage: d.kept === "local" ? 3 : 2 }];
 			});
+			const replaced = decisions.some((d) => d.dropped !== undefined);
 			let backupDir: string | null = null;
-			if (discarded.length) {
+			if (discarded.length || replaced) {
 				backupDir = freshBackupDir(cwd, `${BACKUP_ROOT}/conflicts/${stamp(now)}`);
 				for (const { file, stage } of discarded) {
 					const target = path.join(cwd, backupDir, file);
@@ -221,6 +288,13 @@ export function createResolver(exec: Exec, cwd: string) {
 					// git writes the blob itself, so a binary version is kept byte for byte.
 					const out = await exec(["checkout-index", `--stage=${stage}`, "--temp", "--", file]);
 					fs.renameSync(path.join(cwd, out.stdout.slice(0, out.stdout.indexOf("\t"))), target);
+				}
+				// Content read from the upstream revision (a repaired ledger, a chat deleted here): kept first.
+				for (const d of decisions) {
+					if (d.dropped === undefined) continue;
+					const target = path.join(cwd, backupDir, d.path);
+					fs.mkdirSync(path.dirname(target), { recursive: true });
+					fs.writeFileSync(target, d.dropped);
 				}
 				excludeBackups(cwd);
 			}

@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
+import { createResolver, deletionSafeUnion } from "../src/conflicts.ts";
 import { ConflictError, createGit, type PullPolicy, type Resolution } from "../src/git.ts";
 import { fakeGit, type ScriptedCall } from "./fake-git.ts";
 
@@ -15,6 +16,7 @@ const HEAD = ["rev-parse", "-q", "--verify", "HEAD"];
 const MERGING = ["rev-parse", "-q", "--verify", "MERGE_HEAD"];
 const UNMERGED = ["ls-files", "-u", "-z"];
 const PULL = ["pull", "--no-rebase", "--no-edit"];
+const MERGE_BASE = ["merge-base", "HEAD", "@{upstream}"];
 const ABORT = ["merge", "--abort"];
 const COMMIT = ["commit", "--no-edit", "-q"];
 
@@ -49,11 +51,16 @@ const conflicted = (files: Record<string, number[]>): ScriptedCall[] => [
 	{ args: STATUS, result: { stdout: "## main...origin/main [ahead 1, behind 1]\0" } },
 	...noMerge,
 	{ args: HEAD, result: { stdout: "aaa\n" } },
+	// The upstream is fetched first; the divergence is then read again from the current remote tip.
+	{ args: ["fetch"] },
+	{ args: STATUS, result: { stdout: "## main...origin/main [ahead 1, behind 1]\0" } },
+	// Unrelated histories: no merge to repair before pulling.
+	{ args: MERGE_BASE, result: { code: 1 } },
 	{ args: PULL, result: { code: 1, stdout: "CONFLICT (content): Merge conflict" } },
 	{ args: MERGING, result: { stdout: "ccc\n" } },
 	{ args: UNMERGED, result: { stdout: unmerged(files) } },
 ];
-const show = (stage: 2 | 3, file: string, stdout: string): ScriptedCall => ({
+const show = (stage: 1 | 2 | 3, file: string, stdout: string): ScriptedCall => ({
 	args: ["show", `:${stage}:${file}`],
 	result: { stdout },
 });
@@ -218,24 +225,16 @@ describe("automatic conflict resolution", () => {
 		]);
 		assert.equal(await read(`${BACKUP}/${files[0]}`), chat(1000, "remote"));
 	});
-	test("a modify/delete conflict keeps the modified file, with nothing to back up", async () => {
+	test("an unrelated modify/delete conflict keeps the modified file", async () => {
 		const { result, reports } = await pull([
-			...conflicted({ "chats/b.json": [1, 2], "notes.md": [1, 3] }),
-			show(2, "chats/b.json", chat(1, "local")),
+			...conflicted({ "notes.md": [1, 3] }),
 			show(3, "notes.md", "remote notes"),
-			...take("ours", "chats/b.json"),
 			...take("theirs", "notes.md"),
 			{ args: COMMIT },
 		]);
 		assert.equal(result, "pulled");
 		assert.deepEqual(reports, [
-			{
-				backupDir: null,
-				files: [
-					{ path: "chats/b.json", kept: "local", rule: "modified kept" },
-					{ path: "notes.md", kept: "remote", rule: "modified kept" },
-				],
-			},
+			{ backupDir: null, files: [{ path: "notes.md", kept: "remote", rule: "modified kept" }] },
 		]);
 		assert.equal(await exists(".learnharness-git-backup"), false);
 	});
@@ -245,13 +244,44 @@ describe("automatic conflict resolution", () => {
 		await fs.writeFile(path.join(dir, file), "<<<<<<< HEAD\n");
 		const { result, reports } = await pull([
 			...conflicted({ [file]: [1, 2, 3] }),
+			show(1, file, '{"id":1}\n'),
 			show(2, file, '{"id":1}\n{"id":2}\n'),
 			show(3, file, '{"id":1}\n{"id":3}'),
 			{ args: [LIT, "add", "--", file] },
 			{ args: COMMIT },
 		]);
 		assert.equal(result, "pulled");
-		assert.deepEqual(reports, [{ backupDir: null, files: [{ path: file, kept: "both", rule: "union merge" }] }]);
+		assert.deepEqual(reports, [
+			{ backupDir: null, files: [{ path: file, kept: "both", rule: "union merge, deletions kept" }] },
+		]);
+		assert.equal(await read(file), '{"id":1}\n{"id":2}\n{"id":3}\n');
+	});
+	test("S1 a ledger both sides added to passes the pre-pull check and the pull keeps both lines", async () => {
+		const file = "graph/nodes.jsonl";
+		const base = '{"id":1}\n';
+		await fs.mkdir(path.join(dir, "graph"));
+		await fs.writeFile(path.join(dir, file), "<<<<<<< HEAD\n");
+		const { result } = await pull([
+			{ args: STATUS, result: { stdout: "## main...origin/main [ahead 1, behind 1]\0" } },
+			...noMerge,
+			{ args: HEAD, result: { stdout: "aaa\n" } },
+			{ args: ["fetch"] },
+			{ args: STATUS, result: { stdout: "## main...origin/main [ahead 1, behind 1]\0" } },
+			{ args: MERGE_BASE, result: { stdout: "base\n" } },
+			{ args: ["diff", "--name-only", "-z", "base", "HEAD"], result: { stdout: `${file}\0` } },
+			{ args: ["diff", "--name-only", "-z", "base", "@{upstream}"], result: { stdout: `${file}\0` } },
+			{ args: ["show", `base:${file}`], result: { stdout: base } },
+			{ args: ["show", `HEAD:${file}`], result: { stdout: '{"id":1}\n{"id":2}\n' } },
+			{ args: PULL, result: { code: 1, stdout: "CONFLICT (content): Merge conflict" } },
+			{ args: MERGING, result: { stdout: "ccc\n" } },
+			{ args: UNMERGED, result: { stdout: unmerged({ [file]: [1, 2, 3] }) } },
+			show(1, file, base),
+			show(2, file, '{"id":1}\n{"id":2}\n'),
+			show(3, file, '{"id":1}\n{"id":3}'),
+			{ args: [LIT, "add", "--", file] },
+			{ args: COMMIT },
+		]);
+		assert.equal(result, "pulled");
 		assert.equal(await read(file), '{"id":1}\n{"id":2}\n{"id":3}\n');
 	});
 	test("never reuses a backup folder of the same second", async () => {
@@ -535,6 +565,99 @@ describe("choices of a side that is not valid JSON (S17)", () => {
 		const outcome = await pull([...conflicted({ "notes.md": [1, 2, 3] }), { args: ABORT }], { mode: "manual" });
 		await assertRejected(outcome, ["notes.md"], []);
 	});
+});
+
+test("S1 automatic graph modify-delete keeps the deletion instead of asking", async () => {
+	const calls: string[][] = [];
+	const resolver = createResolver(async (args) => {
+		calls.push(args);
+		return { code: 0, stdout: '{"value":"edited"}\n', stderr: "" };
+	}, dir);
+	const result = await resolver.plan(new Map([["graph/nodes.jsonl", new Set([1, 2])]]), { mode: "auto" });
+	assert.deepEqual(result, {
+		decisions: [
+			{
+				path: "graph/nodes.jsonl",
+				kept: "remote",
+				rule: "deletion kept",
+				local: '{"value":"edited"}\n',
+				remote: null,
+			},
+		],
+		undecided: [],
+		notes: [],
+	});
+	assert.deepEqual(calls, [["show", ":2:graph/nodes.jsonl"]]);
+});
+
+test("S1 a ledger deletion meeting a concurrent addition keeps the remote additions only", async () => {
+	const calls: string[][] = [];
+	const versions: Record<string, string> = {
+		":1:graph/nodes.jsonl": '"old"\n',
+		":2:graph/nodes.jsonl": "",
+		":3:graph/nodes.jsonl": '"old"\n"new"\n',
+	};
+	const resolver = createResolver(async (args) => {
+		calls.push(args);
+		return { code: 0, stdout: versions[args[1] ?? ""] ?? "", stderr: "" };
+	}, dir);
+	const result = await resolver.plan(new Map([["graph/nodes.jsonl", new Set([1, 2, 3])]]), { mode: "auto" });
+	assert.deepEqual(result, {
+		decisions: [
+			{
+				path: "graph/nodes.jsonl",
+				kept: "both",
+				rule: "union merge, deletions kept",
+				local: "",
+				remote: '"old"\n"new"\n',
+				merged: '"new"\n',
+			},
+		],
+		undecided: [],
+		notes: [],
+	});
+	assert.deepEqual(calls, [
+		["show", ":1:graph/nodes.jsonl"],
+		["show", ":2:graph/nodes.jsonl"],
+		["show", ":3:graph/nodes.jsonl"],
+	]);
+});
+
+test("S1 deletionSafeUnion keeps every line local kept and every genuinely new upstream line", () => {
+	const base = ['{"id":1}', '{"id":2}'];
+	assert.equal(deletionSafeUnion(base, [], ['{"id":1}', '{"id":2}', '{"id":3}']), '{"id":3}\n');
+	assert.equal(deletionSafeUnion(base, ['{"id":2}'], ['{"id":1}', '{"id":2}', '{"id":1}']), '{"id":2}\n');
+	// Documented residual limit: an upstream edit of a pruned record is a line the base never had, so the new
+	// "deletion wins on both sides" rule does not apply and that line is kept.
+	assert.equal(deletionSafeUnion(base, ['{"id":2}'], ['{"id":2}', '{"id":1,"v":2}']), '{"id":2}\n{"id":1,"v":2}\n');
+});
+
+test("S1 deletionSafeUnion drops a base line either side removed and keeps both sides' additions", () => {
+	const base = ['{"id":"A"}', '{"id":"B"}', '{"id":"C"}', '{"id":"D"}', '{"id":"E"}'];
+	// Concurrent, separated deletions: this computer removed C and the upstream removed B.
+	assert.equal(
+		deletionSafeUnion(
+			base,
+			['{"id":"A"}', '{"id":"B"}', '{"id":"D"}', '{"id":"E"}'],
+			['{"id":"A"}', '{"id":"C"}', '{"id":"D"}', '{"id":"E"}'],
+		),
+		'{"id":"A"}\n{"id":"D"}\n{"id":"E"}\n',
+	);
+	// Each side also added a record: no removed line comes back and both additions are kept.
+	assert.equal(
+		deletionSafeUnion(
+			['{"id":"A"}', '{"id":"B"}', '{"id":"C"}'],
+			['{"id":"A"}', '{"id":"B"}', '{"id":"local"}'],
+			['{"id":"A"}', '{"id":"C"}', '{"id":"remote"}'],
+		),
+		'{"id":"A"}\n{"id":"local"}\n{"id":"remote"}\n',
+	);
+	// An upstream deletion wins over a line this side never touched, and both deleting leaves nothing.
+	assert.equal(
+		deletionSafeUnion(['{"id":"A"}', '{"id":"B"}'], ['{"id":"A"}', '{"id":"B"}'], ['{"id":"A"}']),
+		'{"id":"A"}\n',
+	);
+	assert.equal(deletionSafeUnion(['{"id":"A"}'], [], []), "");
 });
 
 test("conflictDiff compares HEAD with the upstream for one file, read-only", async () => {

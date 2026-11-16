@@ -2,7 +2,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { type CloneResult, cloneInPlace } from "./clone.ts";
-import { type ConflictPolicy, createResolver, parseUnmerged, type Resolution } from "./conflicts.ts";
+import {
+	type ConflictPolicy,
+	createResolver,
+	deletionDecision,
+	isChatFile,
+	isGraphLedger,
+	ledgerLines,
+	parseUnmerged,
+	type Repair,
+	type Resolution,
+} from "./conflicts.ts";
 import { conflictMessage } from "./format.ts";
 
 export type { Resolution, ResolvedFile, Side } from "./conflicts.ts";
@@ -287,6 +297,108 @@ export function createGit(run: GitRunner, cwd: string) {
 		const result = await run(["rev-parse", "-q", "--verify", name], { cwd });
 		return result.code === 0 ? result.stdout.trim() : null;
 	}
+	/** The commit HEAD and the upstream share, or null when their histories are unrelated. */
+	async function mergeBase(): Promise<string | null> {
+		const result = await run(["merge-base", "HEAD", "@{upstream}"], { cwd });
+		const base = result.stdout.trim();
+		return result.code === 0 && base ? base : null;
+	}
+	/** Paths whose content differs between two revisions; `-z` keeps the names raw, never quoted. */
+	async function changedPaths(from: string, to: string): Promise<string[]> {
+		return (await exec(["diff", "--name-only", "-z", from, to])).stdout.split("\0").filter(Boolean);
+	}
+	/** Content of `file` at `rev`, or null when that revision does not have it. */
+	async function contentAt(rev: string, file: string): Promise<string | null> {
+		const result = await run(["show", `${rev}:${file}`], { cwd });
+		return result.code === 0 ? result.stdout : null;
+	}
+	/**
+	 * Paths the incoming merge must repair instead of letting a line union undo a removal here: a graph ledger this
+	 * computer removed lines from, or a chat it deleted, that the upstream also changed. Every other path keeps the
+	 * ordinary pull, and unrelated histories have no base to compare with.
+	 */
+	async function deletionRepairs(): Promise<Repair[]> {
+		const base = await mergeBase();
+		if (base === null) return [];
+		const local = new Set(await changedPaths(base, "HEAD"));
+		const repairs: Repair[] = [];
+		for (const file of await changedPaths(base, "@{upstream}")) {
+			if (!local.has(file)) continue;
+			if (isGraphLedger(file)) {
+				const original = await contentAt(base, file);
+				const kept = await contentAt("HEAD", file);
+				if (original === null || kept === null) continue;
+				const removed = new Set(ledgerLines(kept));
+				if (!ledgerLines(original).some((line) => !removed.has(line))) continue;
+				const repair = { path: file, base: original, local: kept, remote: await contentAt("@{upstream}", file) };
+				// A ledger the committed side already settled needs no rewrite, so git keeps any uncommitted edit.
+				if (deletionDecision(repair) !== null) repairs.push(repair);
+			} else if (isChatFile(file) && (await contentAt("HEAD", file)) === null) {
+				const repair = { path: file, base: null, local: null, remote: await contentAt("@{upstream}", file) };
+				if (deletionDecision(repair) !== null) repairs.push(repair);
+			}
+		}
+		return repairs;
+	}
+	/**
+	 * A repair rewrites a file from its committed content, so an uncommitted edit to that same file would be lost.
+	 * Refusing leaves both the edit and the repository exactly as they were.
+	 */
+	async function refuseDirtyRepairs(current: Status, repairs: readonly Repair[]): Promise<void> {
+		const touched = new Set([...current.staged, ...current.unstaged].map((change) => change.path));
+		const dirty = repairs.map((repair) => repair.path).filter((file) => touched.has(file));
+		if (!dirty.length) return;
+		throw new Error(
+			`Sync needs to rewrite ${dirty.join(", ")}, which has uncommitted changes. Commit or discard them, then pull again.`,
+		);
+	}
+	/**
+	 * Takes over a diverged pull that would undo a deletion: `pull` is never run (the union attribute would bring
+	 * removed lines back). The merge is started without committing, the repair paths are decided so a removal here
+	 * wins, any other conflict gets its usual side, and one merge commit ends it. A step that cannot finish aborts
+	 * the merge, leaving the files as they were.
+	 */
+	async function repairMerge(upstream: string, repairs: readonly Repair[], policy: PullPolicy): Promise<"pulled"> {
+		const args = ["merge", "--no-ff", "--no-commit", "@{upstream}"];
+		const started = await run(args, { cwd });
+		// A merge that stopped on conflicts leaves MERGE_HEAD behind; any other failure changed nothing.
+		if (started.code !== 0 && (await revision("MERGE_HEAD")) === null) return fail(args, started);
+		const decisions = [];
+		for (const repair of repairs) {
+			const decision = deletionDecision(repair);
+			if (decision !== null) decisions.push(decision);
+		}
+		const repaired = new Set(decisions.map((decision) => decision.path));
+		const plan = async () => {
+			const unmerged = parseUnmerged((await exec(["ls-files", "-u", "-z"])).stdout);
+			const other = new Map([...unmerged].filter(([file]) => !repaired.has(file)));
+			return { other, planned: await resolver.plan(other, policy) };
+		};
+		let outcome: Awaited<ReturnType<typeof plan>>;
+		try {
+			outcome = await plan();
+		} catch (error) {
+			await run(["merge", "--abort"], { cwd });
+			throw error;
+		}
+		if (outcome.planned.undecided.length) {
+			await exec(["merge", "--abort"]);
+			const chosen = new Set(outcome.planned.decisions.filter((d) => d.rule === "your choice").map((d) => d.path));
+			const listed = [...outcome.other.keys()].filter(
+				(file) => chosen.has(file) || outcome.planned.undecided.includes(file),
+			);
+			throw new ConflictError(upstream, listed, outcome.planned.notes);
+		}
+		let resolution: Resolution;
+		try {
+			resolution = await resolver.apply([...decisions, ...outcome.planned.decisions], policy.now ?? new Date());
+		} catch (error) {
+			await run(["merge", "--abort"], { cwd });
+			throw error;
+		}
+		policy.onResolved?.(resolution);
+		return "pulled";
+	}
 	/** A merge the user started must never be committed half-resolved or aborted by the plugin. */
 	async function refuseDuringMerge(): Promise<void> {
 		// A merge, cherry-pick, revert or rebase the user left unfinished belongs to them.
@@ -388,15 +500,27 @@ export function createGit(run: GitRunner, cwd: string) {
 			return { committed: true };
 		},
 		/**
-		 * Merges the upstream. On conflicts every file gets a side from `policy` and the merge is committed;
-		 * when any file cannot be decided the merge is aborted (files unchanged) and ConflictError lists them.
+		 * Fetches first, then merges the upstream. A diverged pull that would undo a deletion is repaired before any
+		 * commit; otherwise conflicts get a side from `policy`, and one nothing can decide aborts the merge (files
+		 * unchanged) with a ConflictError listing it.
 		 */
 		async pull(policy: PullPolicy = { mode: "manual" }): Promise<"no-upstream" | "up-to-date" | "pulled"> {
-			const { upstream } = await status();
-			if (!upstream) return "no-upstream";
+			const current = await status();
+			if (!current.upstream) return "no-upstream";
 			// Only a merge started by this pull may be resolved or aborted below.
 			await refuseDuringMerge();
 			const before = await revision("HEAD");
+			// Fetch before reading the divergence: a stale @{upstream} would hide the very change that must not
+			// undo a deletion made here.
+			await exec(["fetch"]);
+			const fresh = await status();
+			if (fresh.ahead > 0 && fresh.behind > 0) {
+				const repairs = await deletionRepairs();
+				if (repairs.length) {
+					await refuseDirtyRepairs(fresh, repairs);
+					return repairMerge(current.upstream, repairs, policy);
+				}
+			}
 			const args = ["pull", "--no-rebase", "--no-edit"];
 			const result = await run(args, { cwd });
 			if (result.code === 0) return (await revision("HEAD")) === before ? "up-to-date" : "pulled";
@@ -411,7 +535,7 @@ export function createGit(run: GitRunner, cwd: string) {
 				// A rejected choice is undecided, so its file stays listed next to its note.
 				const chosen = new Set(decisions.filter((d) => d.rule === "your choice").map((d) => d.path));
 				const listed = [...conflicts.keys()].filter((file) => chosen.has(file) || undecided.includes(file));
-				throw new ConflictError(upstream, listed, notes);
+				throw new ConflictError(current.upstream, listed, notes);
 			}
 			let resolution: Resolution;
 			try {
