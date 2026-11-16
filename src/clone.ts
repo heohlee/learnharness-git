@@ -25,6 +25,11 @@ export interface CloneGit {
 	run: Exec;
 }
 
+/** Moves a path to another one; tests substitute a rename that fails to prove a failed clone keeps the original. */
+export type Move = (from: string, to: string) => void;
+
+const fsMove: Move = (from, to) => fs.renameSync(from, to);
+
 const isDirectory = (file: string) => fs.statSync(file, { throwIfNoEntry: false })?.isDirectory() === true;
 
 function containsFile(dir: string): boolean {
@@ -81,6 +86,81 @@ function removeEmpty(dir: string): void {
 	if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
 }
 
+/** The Git metadata and the backup folder are handled on their own: never walk inside them. */
+const skipped = (rel: string, child: string) => !rel && (child === ".git" || child === BACKUP_ROOT);
+
+/**
+ * The entries of a folder, or null when this process cannot list it. Listing is the only step that can fail on
+ * permissions, and a folder nobody can read must never turn a clone into a raw filesystem error.
+ */
+function entries(dir: string) {
+	try {
+		return fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Every path under `cwd` as "a/b", so a failed clone can remove exactly what it added and nothing else.
+ * A folder that cannot be listed goes into `unreadable` and is treated as pre-existing: what was not seen is kept.
+ */
+function inventory(cwd: string, unreadable: Set<string>): Set<string> {
+	const found = new Set<string>();
+	const walk = (rel: string): void => {
+		const listed = entries(path.join(cwd, rel));
+		if (!listed) {
+			unreadable.add(rel);
+			return;
+		}
+		for (const entry of listed) {
+			const child = rel ? `${rel}/${entry.name}` : entry.name;
+			if (skipped(rel, child)) continue;
+			found.add(child);
+			if (entry.isDirectory()) walk(child);
+		}
+	};
+	if (fs.existsSync(cwd)) walk("");
+	return found;
+}
+
+/**
+ * Deletes every path under `cwd` that `keep` does not have: the files a checkout wrote and the folders it created,
+ * deepest first, so a file this computer already had is never touched. `problems` names what could not be removed.
+ * A folder that cannot be listed is never entered, so nothing it holds can be deleted unseen.
+ */
+function discard(cwd: string, keep: ReadonlySet<string>, unreadable: ReadonlySet<string>, problems: string[]): void {
+	const walk = (rel: string): void => {
+		if (unreadable.has(rel)) return;
+		const listed = entries(path.join(cwd, rel));
+		if (!listed) return;
+		for (const entry of listed) {
+			const child = rel ? `${rel}/${entry.name}` : entry.name;
+			if (skipped(rel, child)) continue;
+			const file = path.join(cwd, child);
+			if (entry.isDirectory()) walk(child);
+			if (keep.has(child)) continue;
+			try {
+				if (entry.isDirectory()) fs.rmdirSync(file);
+				else fs.rmSync(file);
+			} catch (error) {
+				problems.push(`${child} could not be removed (${(error as NodeJS.ErrnoException).code ?? "error"})`);
+			}
+		}
+	};
+	walk("");
+}
+
+/** Ends `text` with a period when it has no final punctuation, so a detail can follow the original message. */
+const asSentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+/**
+ * A checkout can exit 0 and still skip files: git only warns, so the clone is not done until the worktree holds
+ * every path of the branch it checked out with the content that branch has.
+ */
+const incompleteMessage = (files: readonly string[]) =>
+	`Clone incomplete: git did not write ${files.join(", ")} from the remote. Retry the clone.`;
+
 /** `base` (relative to `cwd`), or `base-2`, `base-3`… when it exists: never write onto an earlier backup. */
 export function freshBackupDir(cwd: string, base: string): string {
 	let dir = base;
@@ -106,14 +186,24 @@ export function excludeBackups(cwd: string): void {
 	appendExcludes(path.join(cwd, ".git", "info", "exclude"), [`${BACKUP_ROOT}/`]);
 }
 
-export async function cloneInPlace(git: CloneGit, cwd: string, url: string, now: Date): Promise<CloneResult> {
+export async function cloneInPlace(
+	git: CloneGit,
+	cwd: string,
+	url: string,
+	now: Date,
+	move: Move = fsMove,
+): Promise<CloneResult> {
 	if (hasOwnData(cwd)) {
 		throw new Error("This folder has sessions or a graph. Clone only into a new data folder.");
 	}
 	const gitDir = path.join(cwd, ".git");
 	const hadGitDir = fs.existsSync(gitDir);
 	const createdRoot = !fs.existsSync(path.join(cwd, BACKUP_ROOT));
-	const moved: { from: string; to: string }[] = [];
+	// Everything already here, so a failed attempt can remove exactly what it added and nothing else. A folder this
+	// process cannot list is not an error: the clone goes on and everything inside it counts as pre-existing.
+	const unreadable = new Set<string>();
+	const before = inventory(cwd, unreadable);
+	const moved: { rel: string; from: string; to: string }[] = [];
 	let backupDir: string | null = null;
 	try {
 		await git.exec(["init", "-b", "main"]);
@@ -141,26 +231,37 @@ export async function cloneInPlace(git: CloneGit, cwd: string, url: string, now:
 				const from = path.join(cwd, rel);
 				const to = path.join(cwd, backupDir, rel);
 				fs.mkdirSync(path.dirname(to), { recursive: true });
-				fs.renameSync(from, to);
-				moved.push({ from, to });
+				move(from, to);
+				moved.push({ rel, from, to });
 			}
 		}
 		excludeBackups(cwd);
 		await git.exec(["checkout", "-b", branch, "--track", `origin/${branch}`]);
+		// Anything git left differing from the commit it checked out is a file it did not write.
+		const unwritten = (await git.exec(["diff", "--name-only", "-z", "HEAD"])).stdout.split("\0").filter(Boolean);
+		if (unwritten.length) throw new Error(incompleteMessage(unwritten));
 		return { branch, backupDir, backedUp: colliding };
 	} catch (error) {
-		for (const { from, to } of moved.reverse()) {
+		const problems: string[] = [];
+		// A moved original is this clone's own work again: drop its path from the inventory so the file the checkout
+		// wrote there is removed before the original is put back, and the restore never lands on top of it.
+		const keep = new Set(before);
+		for (const { rel } of moved) keep.delete(rel);
+		discard(cwd, keep, unreadable, problems);
+		for (const { rel, from, to } of [...moved].reverse()) {
 			try {
 				fs.mkdirSync(path.dirname(from), { recursive: true });
-				fs.renameSync(to, from);
+				move(to, from);
 			} catch {
-				// The file stays in the backup folder; it is never deleted.
+				// The file stays in the backup folder; it is never deleted, and the caller is told exactly where.
+				problems.push(`${rel} could not be moved back and stays in ${backupDir}/${rel}`);
 			}
 		}
 		// Remove only the folders this clone created; earlier backups stay as they were.
 		if (backupDir !== null) removeEmpty(path.join(cwd, backupDir));
 		if (createdRoot) removeEmpty(path.join(cwd, BACKUP_ROOT));
 		if (!hadGitDir) fs.rmSync(gitDir, { recursive: true, force: true });
-		throw error;
+		const message = error instanceof Error ? error.message : String(error);
+		throw problems.length ? new Error(`${asSentence(message)} Cleanup was incomplete: ${problems.join("; ")}.`) : error;
 	}
 }

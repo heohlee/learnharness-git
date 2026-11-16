@@ -506,6 +506,63 @@ describe("clone", () => {
 			{ restartRequired: false, lastError: "git fetch failed: denied", repo: { kind: "none" }, remote: null },
 		);
 	});
+	test("a clone that stopped before writing every file asks for no restart either", async () => {
+		const message = "Clone incomplete: git did not write chats/one.json from the remote. Retry the clone.";
+		const s = setup({
+			repo: { kind: "none" },
+			git: { clone: async () => Promise.reject(new Error(message)) },
+		});
+		await assert.rejects(call(s, "clone", { url: URL }), { message });
+		const last = s.events.at(-1)?.data as CloneState & { lastError: string; busy: string | null };
+		assert.deepEqual(
+			{
+				restartRequired: last.restartRequired,
+				cloneBackupDir: last.cloneBackupDir,
+				cloneBranch: last.cloneBranch,
+				busy: last.busy,
+				lastError: last.lastError,
+				repo: last.repo,
+			},
+			{
+				restartRequired: false,
+				cloneBackupDir: null,
+				cloneBranch: null,
+				busy: null,
+				lastError: message,
+				repo: { kind: "none" },
+			},
+		);
+	});
+	test("the same folder accepts a retry after a clone that stopped early", async () => {
+		const message = "Clone incomplete: git did not write chats/one.json from the remote. Retry the clone.";
+		let attempts = 0;
+		const s = setup({
+			repo: { kind: "none" },
+			git: {
+				clone: async () => {
+					attempts += 1;
+					if (attempts === 1) throw new Error(message);
+					return { branch: "main", backupDir: null, backedUp: [] };
+				},
+			},
+		});
+		await assert.rejects(call(s, "clone", { url: URL }), { message });
+		const afterFailure = s.events.at(-1)?.data as CloneState & { busy: string | null };
+		assert.equal(afterFailure.busy, null);
+		assert.equal(afterFailure.restartRequired, false);
+		await call(s, "clone", { url: URL });
+		const afterRetry = s.events.at(-1)?.data as CloneState & { lastError: string | null };
+		assert.deepEqual(
+			{
+				restartRequired: afterRetry.restartRequired,
+				remote: afterRetry.remote,
+				branch: afterRetry.cloneBranch,
+				lastError: afterRetry.lastError,
+				repo: afterRetry.repo,
+			},
+			{ restartRequired: true, remote: URL, branch: "main", lastError: null, repo: { kind: "repo" } },
+		);
+	});
 });
 
 describe("conflicts", () => {
