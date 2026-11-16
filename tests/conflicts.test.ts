@@ -272,6 +272,8 @@ describe("automatic conflict resolution", () => {
 			{ args: ["diff", "--name-only", "-z", "base", "@{upstream}"], result: { stdout: `${file}\0` } },
 			{ args: ["show", `base:${file}`], result: { stdout: base } },
 			{ args: ["show", `HEAD:${file}`], result: { stdout: '{"id":1}\n{"id":2}\n' } },
+			// The upstream is read too: it removed no record, so the ordinary pull runs.
+			{ args: ["show", `@{upstream}:${file}`], result: { stdout: '{"id":1}\n{"id":3}\n' } },
 			{ args: PULL, result: { code: 1, stdout: "CONFLICT (content): Merge conflict" } },
 			{ args: MERGING, result: { stdout: "ccc\n" } },
 			{ args: UNMERGED, result: { stdout: unmerged({ [file]: [1, 2, 3] }) } },

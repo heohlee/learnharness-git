@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import {
 	ConflictError,
+	createGit,
 	type Git,
 	MergeInProgressError,
 	type PullPolicy,
@@ -10,6 +14,7 @@ import {
 } from "../src/git.ts";
 import { type Clock, createService } from "../src/service.ts";
 import { DEFAULT_SETTINGS, type Settings } from "../src/settings.ts";
+import { fakeGit } from "./fake-git.ts";
 
 function setup(options: { settings?: Partial<Settings>; repo?: RepoState; git?: Partial<Git> } = {}) {
 	const calls: string[] = [];
@@ -319,6 +324,46 @@ describe("handlers", () => {
 	});
 });
 
+describe("diff confinement", () => {
+	let base = "";
+	let root = "";
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), "learnharness-git-service-diff-"));
+		root = path.join(base, "data");
+		await fs.mkdir(path.join(root, "notes"), { recursive: true });
+		await fs.writeFile(path.join(root, "notes", "nested.json"), "{}\n");
+		await fs.writeFile(path.join(base, "secret.txt"), "outside\n");
+	});
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	test("the diff handler refuses a path outside the data folder and spawns no git call", async () => {
+		const fake = fakeGit([{ args: ["rev-parse", "--show-toplevel"], result: { stdout: `${root}\n` } }]);
+		const s = setup({ git: createGit(fake.run, root) });
+		await assert.rejects(call(s, "diff", { path: "../secret.txt", staged: false, untracked: true }), {
+			message:
+				'Cannot show "../secret.txt": the change viewer only shows a relative path that resolves inside the learning-data folder.',
+		});
+		// Only the repository check ran: the refused diff spawned nothing.
+		assert.deepEqual(fake.calls, [{ args: ["rev-parse", "--show-toplevel"], cwd: root }]);
+		fake.done();
+		assert.deepEqual(s.events, []);
+	});
+	test("the diff handler still shows an untracked nested file", async () => {
+		const fake = fakeGit([
+			{ args: ["rev-parse", "--show-toplevel"], result: { stdout: `${root}\n` } },
+			{
+				args: ["--literal-pathspecs", "diff", "--no-color", "--no-index", "--", "/dev/null", "notes/nested.json"],
+				result: { code: 1, stdout: "+{}" },
+			},
+		]);
+		const s = setup({ git: createGit(fake.run, root) });
+		assert.equal(await call(s, "diff", { path: "notes/nested.json", staged: false, untracked: true }), "+{}");
+		fake.done();
+	});
+});
+
 describe("remote", () => {
 	const URL = "git@github.com:me/learning-data.git";
 	test("state reports origin's URL", async () => {
@@ -335,25 +380,17 @@ describe("remote", () => {
 		assert.deepEqual(s.calls, ["repoState", "listFiles", "status", `historyFiles ${JSON.stringify(["main"])}`]);
 		assert.deepEqual(s.events, []);
 	});
+	const credential = "Do not put credentials in the remote URL. Use SSH keys or a Git credential helper.";
 	const invalid: [unknown, string][] = [
 		["", "Remote URL must not be empty."],
 		["  ", "Remote URL must not be empty."],
 		["git@host:a b.git", "Remote URL must not contain spaces."],
 		["--upload-pack=x", "Remote URL must not start with “-”."],
-		[
-			"https://me:abc123@github.com/me/data.git",
-			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
-		],
+		["https://me:abc123@github.com/me/data.git", credential],
 		[3, "Remote URL must not be empty."],
 		["git@h:a\nb.git", "Remote URL must not contain spaces."],
-		[
-			"https://ghp_abcdef123456@github.com/me/data.git",
-			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
-		],
-		[
-			"https://github.com/me/data.git?access_token=abc",
-			"Do not put a password or token in the remote URL. Use SSH or a Git credential helper.",
-		],
+		["https://ghp_abcdef123456@github.com/me/data.git", credential],
+		["https://github.com/me/data.git?access_token=abc", credential],
 	];
 	for (const [url, message] of invalid) {
 		test(`rejects remote URL ${JSON.stringify(url)} without running git`, async () => {
@@ -369,6 +406,60 @@ describe("remote", () => {
 		const url = "https://me@github.com/me/data.git";
 		assert.equal(((await call(s, "previewRemote", { url })) as { url: string }).url, url);
 	});
+	const embedded: [string, string][] = [
+		["a password", "https://me:abc123@github.com/me/data.git"],
+		["a percent-encoded colon in the user name", "https://me%3Aabc123@github.com/me/data.git"],
+		["a percent-encoded “@” in the user name", "https://me%40corp@github.com/me/data.git"],
+		["a percent-encoded token name as the user name", "https://%74oken@github.com/me/data.git"],
+		["a percent-encoded token prefix as the user name", "https://%67hp_abcdef123456@github.com/me/data.git"],
+		["a token as the user name", "https://ghp_abcdef123456@github.com/me/data.git"],
+		["a password in an ssh URL", "ssh://me:abc123@github.com/me/data.git"],
+		["a token in a query key and value", "https://github.com/me/data.git?access_token=ghp_abc123"],
+		["a token in a percent-encoded query key", "https://github.com/me/data.git?%74oken=abc"],
+		["a token in a query value", "https://github.com/me/data.git?auth=ghp_abc123"],
+		["a token in the fragment", "https://github.com/me/data.git#access_token=abc"],
+		["a GitLab token as the user name", "https://glpat_abcdef123456@github.com/me/data.git"],
+		["a hyphenated GitLab token as the user name", "https://glpat-Abcdef0123456789abcde@host/x"],
+		["a password parameter", "https://github.com/me/data.git?password=abc123"],
+		["a percent-encoded token name in the fragment", "https://github.com/me/data.git#%74oken=abc"],
+		["a percent-encoded token value in the query", "https://github.com/me/data.git?auth=%67hp_abc123"],
+		["a percent-encoded colon in an ssh user name", "ssh://me%3Aabc123@github.com/me/data.git"],
+	];
+	for (const [why, url] of embedded) {
+		test(`rejects ${why} without running git or changing state`, async () => {
+			const s = setup();
+			const before = await call(s, "state");
+			s.calls.length = 0;
+			s.events.length = 0;
+			await assert.rejects(call(s, "previewRemote", { url }), { message: credential });
+			await assert.rejects(call(s, "connectRemote", { url }), { message: credential });
+			await assert.rejects(call(s, "clone", { url }), { message: credential });
+			assert.deepEqual(s.calls, []);
+			assert.deepEqual(s.events, []);
+			assert.deepEqual(await call(s, "state"), before);
+		});
+	}
+	const plain: [string, string][] = [
+		["an scp-style SSH remote", "git@github.com:me/learning-data.git"],
+		["an ssh URL with a user name", "ssh://git@github.com/me/data.git"],
+		["a plain https URL", "https://github.com/me/data.git"],
+		["a plain http URL", "http://github.com/me/data.git"],
+		["a user name without a password", "https://me@github.com/me/data.git"],
+		["an https URL with a path naming a token", "https://github.com/me/token-data.git"],
+		["a local path", "/home/me/learning-data"],
+		["a relative local path", "learning-data"],
+		["a file URL", "file:///home/me/learning-data"],
+		["an uppercase host", "https://GitHub.com/me/data.git"],
+		["a percent-encoded path segment", "https://github.com/me/my%20data.git"],
+		["an ssh URL with a port", "ssh://git@github.com:22/me/data.git"],
+	];
+	for (const [why, url] of plain) {
+		test(`accepts ${why}`, async () => {
+			const s = setup();
+			assert.equal(((await call(s, "previewRemote", { url })) as { url: string }).url, url);
+			assert.deepEqual(s.calls, ["repoState", "listFiles", "status", `historyFiles ${JSON.stringify(["main"])}`]);
+		});
+	}
 	test("connectRemote commits pending changes, sets origin and pushes with upstream", async () => {
 		const s = setup();
 		assert.deepEqual(await call(s, "connectRemote", { url: ` ${URL} ` }), { remote: URL });

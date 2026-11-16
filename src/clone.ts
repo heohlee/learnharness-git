@@ -72,6 +72,10 @@ function collisions(cwd: string, remote: readonly string[]): string[] {
 	return [...found].sort();
 }
 
+/** The paths a clone of `remote` can write: every tracked file and the folders leading to it. */
+const ownedPaths = (remote: readonly string[]) =>
+	new Set(remote.flatMap((file) => file.split("/").map((_, i, parts) => parts.slice(0, i + 1).join("/"))));
+
 const pad = (n: number) => String(n).padStart(2, "0");
 /** Local time as YYYY-MM-DD_HH-mm-ss, safe in folder names. */
 export const stamp = (d: Date) =>
@@ -125,11 +129,10 @@ function inventory(cwd: string, unreadable: Set<string>): Set<string> {
 }
 
 /**
- * Deletes every path under `cwd` that `keep` does not have: the files a checkout wrote and the folders it created,
- * deepest first, so a file this computer already had is never touched. `problems` names what could not be removed.
- * A folder that cannot be listed is never entered, so nothing it holds can be deleted unseen.
+ * Deletes the paths in `remove`, deepest first, and a folder only once no file is left in it, so a file another
+ * process wrote stays. `problems` names what could not be removed; a folder nobody can list is never entered.
  */
-function discard(cwd: string, keep: ReadonlySet<string>, unreadable: ReadonlySet<string>, problems: string[]): void {
+function discard(cwd: string, remove: ReadonlySet<string>, unreadable: ReadonlySet<string>, problems: string[]): void {
 	const walk = (rel: string): void => {
 		if (unreadable.has(rel)) return;
 		const listed = entries(path.join(cwd, rel));
@@ -139,7 +142,8 @@ function discard(cwd: string, keep: ReadonlySet<string>, unreadable: ReadonlySet
 			if (skipped(rel, child)) continue;
 			const file = path.join(cwd, child);
 			if (entry.isDirectory()) walk(child);
-			if (keep.has(child)) continue;
+			if (!remove.has(child)) continue;
+			if (entry.isDirectory() && fs.readdirSync(file).length > 0) continue;
 			try {
 				if (entry.isDirectory()) fs.rmdirSync(file);
 				else fs.rmSync(file);
@@ -198,16 +202,24 @@ export async function cloneInPlace(
 	}
 	const gitDir = path.join(cwd, ".git");
 	const hadGitDir = fs.existsSync(gitDir);
+	const headFile = path.join(gitDir, "HEAD");
+	const oldHead = hadGitDir && fs.existsSync(headFile) ? fs.readFileSync(headFile, "utf8") : null;
+	const hadIndex = hadGitDir && fs.existsSync(path.join(gitDir, "index"));
 	const createdRoot = !fs.existsSync(path.join(cwd, BACKUP_ROOT));
 	// Everything already here, so a failed attempt can remove exactly what it added and nothing else. A folder this
 	// process cannot list is not an error: the clone goes on and everything inside it counts as pre-existing.
 	const unreadable = new Set<string>();
 	const before = inventory(cwd, unreadable);
+	// What this attempt may remove again: the paths the fetched revision tracks, empty until the remote is listed.
+	const owned = new Set<string>();
 	const moved: { rel: string; from: string; to: string }[] = [];
 	let backupDir: string | null = null;
+	let addedBranch: string | null = null;
+	let addedRemote = false;
 	try {
 		await git.exec(["init", "-b", "main"]);
 		await git.exec(["remote", "add", "origin", url]);
+		addedRemote = true;
 		await git.exec(["fetch", "origin"]);
 		const symref = (await git.exec(["ls-remote", "--symref", "origin", "HEAD"])).stdout;
 		const branch = /^ref: refs\/heads\/([^\s-]\S*)\tHEAD$/m.exec(symref)?.[1] ?? "main";
@@ -223,7 +235,9 @@ export async function cloneInPlace(
 			"--name-only",
 			`origin/${branch}`,
 		]);
-		const colliding = collisions(cwd, listing.stdout.split("\0").filter(Boolean));
+		const tracked = listing.stdout.split("\0").filter(Boolean);
+		for (const rel of ownedPaths(tracked)) owned.add(rel);
+		const colliding = collisions(cwd, tracked);
 
 		if (colliding.length) {
 			backupDir = freshBackupDir(cwd, `${BACKUP_ROOT}/${stamp(now)}`);
@@ -237,17 +251,18 @@ export async function cloneInPlace(
 		}
 		excludeBackups(cwd);
 		await git.exec(["checkout", "-b", branch, "--track", `origin/${branch}`]);
+		addedBranch = branch;
 		// Anything git left differing from the commit it checked out is a file it did not write.
 		const unwritten = (await git.exec(["diff", "--name-only", "-z", "HEAD"])).stdout.split("\0").filter(Boolean);
 		if (unwritten.length) throw new Error(incompleteMessage(unwritten));
 		return { branch, backupDir, backedUp: colliding };
 	} catch (error) {
 		const problems: string[] = [];
-		// A moved original is this clone's own work again: drop its path from the inventory so the file the checkout
-		// wrote there is removed before the original is put back, and the restore never lands on top of it.
-		const keep = new Set(before);
-		for (const { rel } of moved) keep.delete(rel);
-		discard(cwd, keep, unreadable, problems);
+		// Only what the fetched revision tracks, never a path that was already here, is this clone's own work; the
+		// originals moved above are put back below, so the files written over them go first.
+		const remove = new Set([...owned].filter((rel) => !before.has(rel)));
+		for (const { rel } of moved) remove.add(rel);
+		discard(cwd, remove, unreadable, problems);
 		for (const { rel, from, to } of [...moved].reverse()) {
 			try {
 				fs.mkdirSync(path.dirname(from), { recursive: true });
@@ -260,7 +275,14 @@ export async function cloneInPlace(
 		// Remove only the folders this clone created; earlier backups stay as they were.
 		if (backupDir !== null) removeEmpty(path.join(cwd, backupDir));
 		if (createdRoot) removeEmpty(path.join(cwd, BACKUP_ROOT));
+		// A repository this attempt created goes away; one that was already here only loses what it gained.
 		if (!hadGitDir) fs.rmSync(gitDir, { recursive: true, force: true });
+		else {
+			if (addedBranch !== null) await git.run(["update-ref", "-d", `refs/heads/${addedBranch}`]);
+			if (addedRemote) await git.run(["remote", "remove", "origin"]);
+			if (!hadIndex) fs.rmSync(path.join(gitDir, "index"), { force: true, recursive: true });
+			if (oldHead !== null && fs.readFileSync(headFile, "utf8") !== oldHead) fs.writeFileSync(headFile, oldHead);
+		}
 		const message = error instanceof Error ? error.message : String(error);
 		throw problems.length ? new Error(`${asSentence(message)} Cleanup was incomplete: ${problems.join("; ")}.`) : error;
 	}

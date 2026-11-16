@@ -54,17 +54,73 @@ function paths(input: unknown): string[] {
 	return value;
 }
 
-/** A remote URL safe to hand to git: no options, no spaces, no embedded password or token. */
+/** Prefixes that GitHub, GitLab and similar use for access tokens pasted in place of a user name. */
+const TOKEN_PREFIX = /^(?:gh[pousr]_|github_pat_|glpat[-_])/i;
+
+/** Words that name a credential in a user name or in a query or fragment parameter. */
+const CREDENTIAL_NAME = /token|passw|pwd|secret|api[_-]?key/i;
+
+/** Decodes percent escapes; text that is not a valid escape stays as written. */
+function decoded(text: string): string {
+	try {
+		return decodeURIComponent(text);
+	} catch {
+		return text;
+	}
+}
+
+/** The user information of a `scheme://` URL, or null when it has none. */
+function userinfo(url: string): string | null {
+	return /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)@/i.exec(url)?.[1] ?? null;
+}
+
+/** `[name, value]` of every query string and fragment parameter, in the order they appear. */
+function parameters(url: string): [string, string][] {
+	const rest = url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, "");
+	const hash = rest.indexOf("#");
+	const beforeHash = hash === -1 ? rest : rest.slice(0, hash);
+	const fragment = hash === -1 ? "" : rest.slice(hash + 1);
+	const query = beforeHash.includes("?") ? beforeHash.slice(beforeHash.indexOf("?") + 1) : "";
+	return `${query}&${fragment}`
+		.split("&")
+		.filter((pair) => pair.length > 0)
+		.map((pair) => {
+			const equals = pair.indexOf("=");
+			return equals === -1 ? [pair, ""] : [pair.slice(0, equals), pair.slice(equals + 1)];
+		});
+}
+
+/** True when the URL carries a password, an access token, or a parameter that names one. */
+function carriesCredentials(url: string): boolean {
+	const name = userinfo(url);
+	// A user name must be literal: an escape can hide a “:”, an “@” or a token, and the reason is never echoed.
+	if (
+		name !== null &&
+		(name.includes("%") || name.includes(":") || TOKEN_PREFIX.test(name) || CREDENTIAL_NAME.test(name))
+	) {
+		return true;
+	}
+	return parameters(url).some(
+		([key, value]) =>
+			CREDENTIAL_NAME.test(key) ||
+			CREDENTIAL_NAME.test(decoded(key)) ||
+			TOKEN_PREFIX.test(value) ||
+			TOKEN_PREFIX.test(decoded(value)),
+	);
+}
+
+/**
+ * A remote URL safe to hand to git: no options, no spaces, and no embedded credentials. A user name must be
+ * written literally and must not name a credential, so percent-encoded delimiters and encoded tokens are refused.
+ */
 function remoteUrl(input: unknown): string {
 	const raw = record(input).url;
 	const url = typeof raw === "string" ? raw.trim() : "";
 	if (!url) throw new Error("Remote URL must not be empty.");
 	if (/\s/.test(url)) throw new Error("Remote URL must not contain spaces.");
 	if (url.startsWith("-")) throw new Error("Remote URL must not start with “-”.");
-	const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@]*)@/i.exec(url)?.[1] ?? "";
-	const looksLikeToken = /^(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)/i.test(userinfo);
-	if (userinfo.includes(":") || looksLikeToken || /[?&][^=]*token=/i.test(url)) {
-		throw new Error("Do not put a password or token in the remote URL. Use SSH or a Git credential helper.");
+	if (carriesCredentials(url)) {
+		throw new Error("Do not put credentials in the remote URL. Use SSH keys or a Git credential helper.");
 	}
 	return url;
 }

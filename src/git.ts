@@ -282,6 +282,45 @@ function writeExcludeBlock(file: string, lines: readonly string[]): void {
 	fs.writeFileSync(file, next);
 }
 
+/**
+ * Real location of `target`, resolving symlinks in the deepest part that exists, so a path git only reports as
+ * deleted can still be checked through the folders that remain.
+ */
+function realLocation(target: string): string {
+	let current = target;
+	const rest: string[] = [];
+	for (;;) {
+		try {
+			return path.join(fs.realpathSync(current), ...rest);
+		} catch {
+			const parent = path.dirname(current);
+			if (parent === current) return target;
+			rest.unshift(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+/** Separators of a relative path on this platform: both forms on Windows, only “/” elsewhere. */
+const SEPARATORS = path.sep === "/" ? "/" : /[/\\]/;
+
+/**
+ * Physical location of the relative path `file` read from `from`: the segments are walked in order against the real
+ * filesystem instead of being collapsed lexically. A normal segment is appended and resolved at once when it exists,
+ * so a symlink in the middle becomes its target, `..` then steps to the parent of that physical location, and `.`
+ * does nothing. The kernel resolves a symlink before applying a following `..`, so a lexical join would let
+ * `linked/../outside/file` look inside while git reads a file outside.
+ */
+function physicalLocation(from: string, file: string): string {
+	let current = from;
+	for (const segment of file.split(SEPARATORS)) {
+		if (segment === "" || segment === ".") continue;
+		// A root is its own parent, so any number of “..” above it stays there.
+		current = segment === ".." ? path.dirname(current) : realLocation(path.join(current, segment));
+	}
+	return current;
+}
+
 export function createGit(run: GitRunner, cwd: string) {
 	async function fail(args: readonly string[], result: GitResult): Promise<never> {
 		if (AUTH_FAILURE.test(result.stderr)) throw new AuthError(await remoteUrl(), result.stderr.trim());
@@ -313,8 +352,8 @@ export function createGit(run: GitRunner, cwd: string) {
 		return result.code === 0 ? result.stdout : null;
 	}
 	/**
-	 * Paths the incoming merge must repair instead of letting a line union undo a removal here: a graph ledger this
-	 * computer removed lines from, or a chat it deleted, that the upstream also changed. Every other path keeps the
+	 * Paths the incoming merge must repair instead of letting a line union undo a removal: a graph ledger either side
+	 * removed lines from, or a chat this computer deleted, that both sides changed. Every other path keeps the
 	 * ordinary pull, and unrelated histories have no base to compare with.
 	 */
 	async function deletionRepairs(): Promise<Repair[]> {
@@ -328,9 +367,11 @@ export function createGit(run: GitRunner, cwd: string) {
 				const original = await contentAt(base, file);
 				const kept = await contentAt("HEAD", file);
 				if (original === null || kept === null) continue;
-				const removed = new Set(ledgerLines(kept));
-				if (!ledgerLines(original).some((line) => !removed.has(line))) continue;
-				const repair = { path: file, base: original, local: kept, remote: await contentAt("@{upstream}", file) };
+				const remote = await contentAt("@{upstream}", file);
+				const here = new Set(ledgerLines(kept));
+				const there = new Set(ledgerLines(remote ?? ""));
+				if (!ledgerLines(original).some((line) => !here.has(line) || !there.has(line))) continue;
+				const repair = { path: file, base: original, local: kept, remote };
 				// A ledger the committed side already settled needs no rewrite, so git keeps any uncommitted edit.
 				if (deletionDecision(repair) !== null) repairs.push(repair);
 			} else if (isChatFile(file) && (await contentAt("HEAD", file)) === null) {
@@ -453,6 +494,24 @@ export function createGit(run: GitRunner, cwd: string) {
 	async function status(): Promise<Status> {
 		return parseStatus((await exec(["status", "--porcelain=v1", "--branch", "-z", "-uall"])).stdout);
 	}
+	/**
+	 * Refuses a diffed path whose physical location is outside the data directory: an absolute path, a `..` segment
+	 * walking out, a sibling folder that merely shares the folder's name prefix, or a symlink redirecting the file or
+	 * a parent. Only the requested path is named: the location it would resolve to is never echoed back. The check
+	 * runs before any git call, so a refused path changes nothing.
+	 */
+	function confine(file: string): void {
+		const fail = (): never => {
+			throw new Error(
+				`Cannot show ${JSON.stringify(file)}: the change viewer only shows a relative path that resolves inside the learning-data folder.`,
+			);
+		};
+		// An absolute path is refused even when it points inside the folder, so one rule covers every caller.
+		if (path.isAbsolute(file) || path.win32.isAbsolute(file)) fail();
+		const root = realLocation(path.resolve(cwd));
+		const relative = path.relative(root, physicalLocation(root, file));
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) fail();
+	}
 
 	return {
 		/** Whether the data directory itself is the top level of a repository. */
@@ -484,6 +543,7 @@ export function createGit(run: GitRunner, cwd: string) {
 			await exec(paths.length ? [LITERAL, "reset", "-q", "--", ...paths] : [LITERAL, "reset", "-q"]);
 		},
 		async diff(file: string, options: { staged: boolean; untracked: boolean }): Promise<string> {
+			confine(file);
 			if (options.untracked) {
 				return (await exec([LITERAL, "diff", "--no-color", "--no-index", "--", "/dev/null", file], [0, 1])).stdout;
 			}

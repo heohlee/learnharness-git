@@ -39,8 +39,8 @@ interface Decision extends ResolvedFile {
 	remote: string | null;
 	/** Merged content written for "both". */
 	merged?: string;
-	/** Upstream content this decision replaces, saved in the backup folder before it is dropped. */
-	dropped?: string;
+	/** Versions this decision replaces, saved in the backup folder before they are dropped: both sides, when needed. */
+	dropped?: { local?: string; remote?: string };
 }
 
 const LITERAL = "--literal-pathspecs";
@@ -103,13 +103,22 @@ export function deletionDecision(repair: Repair): Decision | null {
 		// Nothing to repair when the committed ledger already holds the answer: git leaves the file (and any
 		// uncommitted edit to it) alone, so writing it here would only risk that edit.
 		if (merged === local) return null;
-		return { path: file, kept: "both", rule: "union merge, deletions kept", local, remote, merged, dropped: remote };
+		// A record this side had that the merged ledger dropped was deleted upstream, so this version is replaced too.
+		const dropped = ledgerLines(local).some((line) => !merged.includes(line)) ? { remote, local } : { remote };
+		return { path: file, kept: "both", rule: "union merge, deletions kept", local, remote, merged, dropped };
 	}
 	// Deletion wins: the app rewrites the ledgers wholesale, so a chat it removed must not come back.
 	if (isChatFile(file) && local === null && remote !== null) {
-		return { path: file, kept: "local", rule: "deletion kept", local: null, remote: null, dropped: remote };
+		return { path: file, kept: "local", rule: "deletion kept", local: null, remote: null, dropped: { remote } };
 	}
 	return null;
+}
+
+/** Writes `text` under `dir` to the backup folder, or to `rel-2`, `rel-3`… when that path is already there. */
+function backupText(cwd: string, dir: string, rel: string, text: string): void {
+	const target = path.join(cwd, freshBackupDir(cwd, path.join(dir, rel)));
+	fs.mkdirSync(path.dirname(target), { recursive: true });
+	fs.writeFileSync(target, text);
 }
 
 /** Conflicted paths, in git's order, with the stages each one has (1 base, 2 local, 3 remote). */
@@ -274,7 +283,7 @@ export function createResolver(exec: Exec, cwd: string) {
 		/** Backs up each discarded version, stages the kept one and commits the merge. */
 		async apply(decisions: readonly Decision[], now: Date): Promise<Resolution> {
 			const discarded = decisions.flatMap((d) => {
-				if (d.kept === "both") return [];
+				if (d.kept === "both" || d.dropped?.remote !== undefined) return [];
 				const loser = d.kept === "local" ? d.remote : d.local;
 				return loser === null ? [] : [{ file: d.path, stage: d.kept === "local" ? 3 : 2 }];
 			});
@@ -289,12 +298,11 @@ export function createResolver(exec: Exec, cwd: string) {
 					const out = await exec(["checkout-index", `--stage=${stage}`, "--temp", "--", file]);
 					fs.renameSync(path.join(cwd, out.stdout.slice(0, out.stdout.indexOf("\t"))), target);
 				}
-				// Content read from the upstream revision (a repaired ledger, a chat deleted here): kept first.
+				// Both versions a repair replaced are saved, so records dropped from either side stay recoverable.
 				for (const d of decisions) {
 					if (d.dropped === undefined) continue;
-					const target = path.join(cwd, backupDir, d.path);
-					fs.mkdirSync(path.dirname(target), { recursive: true });
-					fs.writeFileSync(target, d.dropped);
+					if (d.dropped.remote !== undefined) backupText(cwd, backupDir, d.path, d.dropped.remote);
+					if (d.dropped.local !== undefined) backupText(cwd, backupDir, `${d.path}.local`, d.dropped.local);
 				}
 				excludeBackups(cwd);
 			}
