@@ -28,7 +28,7 @@
 		"@types/node": "24.19.2",
 		"esbuild": "0.28.2",
 		"learnharness-plugin-api": "file:.sdk",
-		"typebox": "1.4.6",
+		"typebox": "1.4.7",
 		"typescript": "7.0.2"
 	}
 }
