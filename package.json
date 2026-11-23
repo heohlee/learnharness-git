@@ -22,13 +22,13 @@
 		"package": "npm run build && node scripts/package.mjs"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.6.7",
+		"@biomejs/biome": "2.6.8",
 		"@earendil-works/pi-agent-core": "1.5.2",
 		"@earendil-works/pi-ai": "1.5.2",
 		"@types/node": "24.19.2",
 		"esbuild": "0.28.2",
 		"learnharness-plugin-api": "file:.sdk",
-		"typebox": "1.4.6",
+		"typebox": "1.4.7",
 		"typescript": "7.0.2"
 	}
 }
